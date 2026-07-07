@@ -1,0 +1,214 @@
+name: Device Farm Run (reutilizável)
+
+# Fluxo único parametrizado por plataforma (android|ios). Chamado por mobile_test.yml.
+# Passos: baixa build do EAS → empacota testes (sem node_modules) → sobe app/pacote/testspec
+# ao Device Farm (create→transfer→wait) → agenda o run injetando as credenciais como
+# environmentVariables → faz polling → coleta os artefatos Allure e publica como artifact.
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: "android | ios"
+        required: true
+        type: string
+
+env:
+  AWS_DEFAULT_REGION: us-west-2
+
+jobs:
+  run:
+    name: "${{ inputs.platform }} — Device Farm"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Instala EAS CLI e Allure
+        run: npm install -g eas-cli allure-commandline
+
+      - name: Resolve parâmetros da plataforma
+        id: vars
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.platform }}" = "android" ]; then
+            echo "app_file=app.apk"          >> "$GITHUB_OUTPUT"
+            echo "app_type=ANDROID_APP"       >> "$GITHUB_OUTPUT"
+            echo "testspec=testspec.yml"      >> "$GITHUB_OUTPUT"
+          else
+            echo "app_file=app.ipa"           >> "$GITHUB_OUTPUT"
+            echo "app_type=IOS_APP"           >> "$GITHUB_OUTPUT"
+            echo "testspec=testspec-ios.yml"  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Baixa o build mais recente do EAS
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          echo "Buscando build ${{ inputs.platform }} INTERNAL finalizada..."
+          BUILD_JSON=$(eas build:list --platform "${{ inputs.platform }}" --limit 1 \
+            --status finished --distribution internal --json --non-interactive)
+          URL=$(echo "$BUILD_JSON" | jq -r '.[0].artifacts.buildUrl // empty')
+          if [ -z "$URL" ]; then
+            echo "::error::Nenhuma build ${{ inputs.platform }} INTERNAL finalizada encontrada no EAS."
+            exit 1
+          fi
+          curl -sSL --retry 3 -o "${{ steps.vars.outputs.app_file }}" "$URL"
+          ls -lh "${{ steps.vars.outputs.app_file }}"
+
+      - name: Empacota os testes (sem node_modules — o Device Farm roda npm install)
+        run: |
+          set -euo pipefail
+          zip -r test-package.zip . \
+            -x "node_modules/*" \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x ".claude/*" \
+            -x "docs/*" \
+            -x "reports/*" \
+            -x "test/screenshots/*" \
+            -x "artifacts/*" \
+            -x "app.apk" -x "app.ipa" \
+            -x "test-package.zip"
+          ls -lh test-package.zip
+
+      - name: Configura credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Sobe artefatos e agenda o run no Device Farm
+        id: schedule
+        env:
+          PROJECT_ARN: ${{ secrets.DEVICE_FARM_PROJECT_ARN }}
+          RUN_NUMBER: ${{ github.run_number }}
+          APP_FILE: ${{ steps.vars.outputs.app_file }}
+          APP_TYPE: ${{ steps.vars.outputs.app_type }}
+          TESTSPEC: ${{ steps.vars.outputs.testspec }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+          TEST_USER_PIN: ${{ secrets.TEST_USER_PIN }}
+        run: |
+          set -euo pipefail
+
+          # Escolhe o device pool conforme a plataforma (secret fica no step, mascarado).
+          if [ "${{ inputs.platform }}" = "android" ]; then
+            POOL_ARN="${{ secrets.DEVICE_FARM_DEVICE_POOL_ARN }}"
+          else
+            POOL_ARN="${{ secrets.DEVICE_FARM_IOS_DEVICE_POOL_ARN }}"
+          fi
+
+          # create → transfer (curl PUT no S3 pré-assinado) → wait até SUCCEEDED.
+          upload() {
+            local name="$1" type="$2" file="$3"
+            local resp arn url status i
+            resp=$(aws devicefarm create-upload --project-arn "$PROJECT_ARN" \
+              --name "$name" --type "$type" --query 'upload.{arn:arn,url:url}' --output json)
+            arn=$(echo "$resp" | jq -r .arn)
+            url=$(echo "$resp" | jq -r .url)
+            curl -sS -T "$file" "$url"
+            for i in $(seq 1 20); do
+              status=$(aws devicefarm get-upload --arn "$arn" --query 'upload.status' --output text)
+              echo "$name: $status ($i/20)"
+              [ "$status" = "SUCCEEDED" ] && { echo "$arn"; return 0; }
+              [ "$status" = "FAILED" ] && { echo "::error::Upload $name falhou"; return 1; }
+              sleep 10
+            done
+            echo "::error::Timeout no upload $name"; return 1
+          }
+
+          APP_ARN=$(upload "app-${RUN_NUMBER}.${APP_FILE##*.}" "$APP_TYPE" "$APP_FILE")
+          TEST_ARN=$(upload "tests-${RUN_NUMBER}.zip" APPIUM_NODE_TEST_PACKAGE test-package.zip)
+          SPEC_ARN=$(upload "spec-${RUN_NUMBER}.yml" APPIUM_NODE_TEST_SPEC "$TESTSPEC")
+
+          # Injeta as credenciais como environmentVariables — o testspec as materializa em .env.
+          ENV_JSON=$(jq -nc \
+            --arg email "$TEST_USER_EMAIL" \
+            --arg pass  "$TEST_USER_PASSWORD" \
+            --arg pin   "$TEST_USER_PIN" \
+            '{environmentVariables:[
+              {name:"TEST_USER_EMAIL",value:$email},
+              {name:"TEST_USER_PASSWORD",value:$pass},
+              {name:"TEST_USER_PIN",value:$pin}
+            ]}')
+
+          TEST_JSON=$(jq -nc \
+            --arg tp "$TEST_ARN" --arg ts "$SPEC_ARN" \
+            '{type:"APPIUM_NODE",testPackageArn:$tp,testSpecArn:$ts}')
+
+          RUN_ARN=$(aws devicefarm schedule-run \
+            --project-arn "$PROJECT_ARN" \
+            --app-arn "$APP_ARN" \
+            --device-pool-arn "$POOL_ARN" \
+            --name "CI ${{ inputs.platform }} #${RUN_NUMBER}" \
+            --test "$TEST_JSON" \
+            --configuration "$ENV_JSON" \
+            --query 'run.arn' --output text)
+          echo "run_arn=$RUN_ARN" >> "$GITHUB_OUTPUT"
+          echo "Run agendado: $RUN_ARN"
+
+      - name: Aguarda o run terminar
+        env:
+          RUN_ARN: ${{ steps.schedule.outputs.run_arn }}
+        run: |
+          set -euo pipefail
+          REACHED_TERMINAL=false
+          STATUS=""; RESULT_VAL=""
+          for i in $(seq 1 120); do
+            READ=$(aws devicefarm get-run --arn "$RUN_ARN" --query 'run.[status,result]' --output text)
+            STATUS=$(echo "$READ" | awk '{print $1}')
+            RESULT_VAL=$(echo "$READ" | awk '{print $2}')
+            echo "Status ($i/120): $STATUS / $RESULT_VAL"
+            case "$STATUS" in
+              PENDING|PENDING_CONCURRENCY|PENDING_DEVICE|PREPARING|RUNNING|SCHEDULING) sleep 60 ;;
+              *) REACHED_TERMINAL=true; break ;;
+            esac
+          done
+          if [ "$REACHED_TERMINAL" != "true" ]; then
+            echo "::error::Timeout aguardando o Device Farm (último status: $STATUS)."
+            exit 1
+          fi
+          echo "::notice::Device Farm ${{ inputs.platform }}: $RESULT_VAL — ver relatório Allure"
+          echo "**Device Farm (${{ inputs.platform }}):** \`$RESULT_VAL\` — o resultado reflete no relatório, não quebra a esteira." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Coleta artefatos (Allure) do Device Farm
+        if: always()
+        env:
+          RUN_ARN: ${{ steps.schedule.outputs.run_arn }}
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts allure-results
+          [ -z "${RUN_ARN:-}" ] && { echo "Sem run_arn — pulando coleta"; exit 0; }
+          i=0
+          for JOB_ARN in $(aws devicefarm list-jobs --arn "$RUN_ARN" --query 'jobs[].arn' --output text); do
+            SUITE_ARN=$(aws devicefarm list-suites --arn "$JOB_ARN" \
+              --query "suites[?name=='Tests Suite'].arn | [0]" --output text)
+            [ -z "$SUITE_ARN" ] || [ "$SUITE_ARN" = "None" ] && { i=$((i+1)); continue; }
+            TEST_ARN=$(aws devicefarm list-tests --arn "$SUITE_ARN" --query 'tests[0].arn' --output text)
+            URL=$(aws devicefarm list-artifacts --arn "$TEST_ARN" --type FILE \
+              --query "artifacts[?name=='Customer Artifacts'].url | [0]" --output text)
+            if [ -n "$URL" ] && [ "$URL" != "None" ]; then
+              curl -sL --retry 3 --max-time 180 "$URL" -o "artifacts/ca-$i.zip" || true
+              unzip -o "artifacts/ca-$i.zip" -d "artifacts/ca-$i" >/dev/null 2>&1 || true
+              # Os allure-results ficam em algum nível dentro do $DEVICEFARM_LOG_DIR extraído.
+              find "artifacts/ca-$i" -type d -name allure-results -exec cp -r {}/. allure-results/ \; 2>/dev/null || true
+            fi
+            i=$((i+1))
+          done
+          echo "allure-results coletados: $(ls -1 allure-results | wc -l) arquivos"
+
+      - name: Publica allure-results como artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results-${{ inputs.platform }}
+          path: allure-results
+          if-no-files-found: warn
+          retention-days: 30

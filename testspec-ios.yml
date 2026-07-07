@@ -1,0 +1,78 @@
+version: 0.1
+
+# ============================================================================
+# testspec-ios.yml — GATED / AINDA NÃO PRONTO
+# ----------------------------------------------------------------------------
+# O job iOS (mobile_test.yml) só roda por dispatch manual com run_ios=true.
+# Antes de considerá-lo funcional, faltam PRÉ-REQUISITOS:
+#   1. Build EAS iOS gerando .ipa com distribution "internal" (o passo de
+#      download do workflow já busca --platform ios).
+#   2. wdio.conf.ts precisa de capabilities iOS: automationName "XCUITest"
+#      e bundleId, em vez de appPackage/appActivity (que são Android).
+#   3. Specs/selectors validados sob XCUITest — os XPath atuais foram escritos
+#      a partir de dumps UiAutomator2 (Android) e podem não casar no iOS.
+#   4. Confirmar o device pool iOS (DEVICE_FARM_IOS_DEVICE_POOL_ARN).
+# Notas de host: o Appium 2 no iOS exige `ios_test_host: macos_sequoia` +
+# DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH_V9. Avaliar na implementação real.
+# ============================================================================
+
+phases:
+  install:
+    commands:
+      # O host iOS vem com Node 14 por padrão, que quebra o WDIO 9. Usamos nvm
+      # para instalar o Node 18. O nvm NÃO persiste entre fases → o bloco se
+      # repete em install, pre_test e test.
+      - export NVM_DIR=$HOME/.nvm
+      - '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+      - nvm install 18 && nvm use 18
+      - node --version
+      - appium --version
+      - cd $DEVICEFARM_TEST_PACKAGE_PATH
+      - npm install --prefer-offline
+
+  pre_test:
+    commands:
+      - export NVM_DIR=$HOME/.nvm
+      - '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+      - nvm use 18
+      - export APPIUM_BASE_PATH=
+      - |-
+        appium --base-path=$APPIUM_BASE_PATH --log-timestamp \
+          --log-no-colors --relaxed-security --default-capabilities \
+          "{\"appium:deviceName\": \"$DEVICEFARM_DEVICE_NAME\", \
+          \"platformName\": \"$DEVICEFARM_DEVICE_PLATFORM_NAME\", \
+          \"appium:app\": \"$DEVICEFARM_APP_PATH\", \
+          \"appium:udid\":\"$DEVICEFARM_DEVICE_UDID\", \
+          \"appium:platformVersion\": \"$DEVICEFARM_DEVICE_OS_VERSION\", \
+          \"appium:automationName\": \"XCUITest\"}" \
+          >> $DEVICEFARM_LOG_DIR/appium.log 2>&1 &
+
+      - |-
+        appium_initialization_time=0;
+        until curl --silent --fail "http://0.0.0.0:4723${APPIUM_BASE_PATH}/status"; do
+          if [[ $appium_initialization_time -gt 30 ]]; then
+            echo "Appium did not start within 30 seconds. Exiting...";
+            exit 1;
+          fi;
+          appium_initialization_time=$((appium_initialization_time + 1));
+          echo "Waiting for Appium to start on port 4723...";
+          sleep 1;
+        done;
+
+  test:
+    commands:
+      - export NVM_DIR=$HOME/.nvm
+      - '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+      - nvm use 18
+      - cd $DEVICEFARM_TEST_PACKAGE_PATH
+      - export PLATFORM=ios
+      # Materializa as credenciais injetadas pelo schedule-run (só nomes vão ao log).
+      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PIN=%s\n" "$TEST_USER_EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" > .env'
+      - npm run wdio
+
+  post_test:
+    commands:
+      - echo "Testes finalizados"
+
+artifacts:
+  - $DEVICEFARM_LOG_DIR

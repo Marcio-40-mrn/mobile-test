@@ -1,0 +1,12 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: arys-mobile-e2e-test-automations
+  title: Arys Mobile Automation
+  description: Automação para o aplicativo mobile Arys
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+spec:
+  type: other
+  lifecycle: experimental
+  owner: group:default/engenharia_qa

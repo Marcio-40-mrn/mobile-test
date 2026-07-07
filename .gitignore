@@ -1,0 +1,17 @@
+.DS_Store
+node_modules/
+dist/
+.mcp.json
+.env
+.env.*
+!.env.example
+.claude/settings*.json
+reports/
+test/screenshots/
+test/videos/
+ui_dump.xml
+*.zip
+test/specs/campanhas.spec.ts
+test/specs/menu.spec.ts
+docs/
+.claude/
