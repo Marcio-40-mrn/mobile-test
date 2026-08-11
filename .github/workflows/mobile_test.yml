@@ -239,7 +239,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: allure-results-${{ matrix.platform }}
+          # O número da run no nome é o que permite apagar este artifact junto com a
+          # pasta run-N podada da branch reports (step "Apaga artifacts das runs podadas").
+          name: allure-results-${{ matrix.platform }}-${{ github.run_number }}
           path: allure-results
           if-no-files-found: warn
           retention-days: 30
@@ -249,14 +251,26 @@ jobs:
     needs: device-farm
     if: always()
     runs-on: ubuntu-latest
+    # Teto duro do job: vale para qualquer step. Sem isto, um ffmpeg travado no handler
+    # interativo segurou o runner por 4h05.
+    timeout-minutes: 30
     permissions:
-      contents: write
+      contents: write   # push na branch reports
+      actions: write    # DELETE em /actions/artifacts/<id>
+    env:
+      # ÚNICA variável de retenção: quantas pastas run-*/ ficam na branch reports.
+      KEEP: "3"
     # Serializa publicações de runs sobrepostas para evitar corrida de push na branch reports.
     concurrency:
       group: reports-publish
       cancel-in-progress: false
 
     steps:
+      - name: Define RUN_DIR (fonte única da verdade)
+        # Calculado UMA vez. Antes era recomputado no publish e no print da URL: se o job
+        # cruzasse a meia-noite UTC entre os dois, a URL apontava para uma pasta inexistente.
+        run: echo "RUN_DIR=run-${{ github.run_number }}-$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
       - name: Checkout main (para ter os scripts)
         uses: actions/checkout@v4
         with:
@@ -273,16 +287,41 @@ jobs:
       - name: Baixa allure-results Android
         uses: actions/download-artifact@v4
         with:
-          name: allure-results-android
+          name: allure-results-android-${{ github.run_number }}
           path: allure-results-android/
         continue-on-error: true
 
       - name: Baixa allure-results iOS
         uses: actions/download-artifact@v4
         with:
-          name: allure-results-ios
+          name: allure-results-ios-${{ github.run_number }}
           path: allure-results-ios/
         continue-on-error: true
+
+      - name: Valida allure-results (exige ao menos um *-result.json)
+        run: |
+          # Diretório não-vazio NÃO serve como critério: environment.properties, categories.json,
+          # executor.json e history/ são arquivos fixos do Allure e produzem um relatório de
+          # 0 testes visualmente idêntico a um sucesso. O único sinal de execução real é
+          # a presença de *-result.json.
+          for PLAT in android ios; do
+            SRC="allure-results-$PLAT"
+            # Diretório ausente = plataforma não rodou nesta run (o iOS é opcional, via input
+            # run_ios). Isso é esperado e não merece anotação — só o caso abaixo merece.
+            if [ ! -d "$SRC" ]; then
+              echo "$PLAT: não executado nesta run"
+              continue
+            fi
+            if [ -n "$(find "$SRC" -maxdepth 1 -type f -name '*-result.json' -print -quit)" ]; then
+              echo "$PLAT: $(find "$SRC" -maxdepth 1 -type f -name '*-result.json' | wc -l) resultado(s) de teste"
+            else
+              # A plataforma rodou mas não trouxe nenhum resultado — isso É um problema.
+              echo "::warning::$SRC existe mas não tem nenhum *-result.json — plataforma $PLAT ignorada nesta run."
+              # Remove o diretório: a partir daqui `[ -d "$SRC" ]` volta a ser critério
+              # correto em TODOS os steps seguintes (histórico, ffmpeg, generate).
+              rm -rf "$SRC"
+            fi
+          done
 
       - name: Checkout da branch reports
         uses: actions/checkout@v4
@@ -300,6 +339,13 @@ jobs:
           # a subpasta da plataforma. Roda ANTES de gerar o relatório atual.
           LATEST=$(ls reports-branch/ | grep "^run-" | sort -V | tail -1)
           for PLAT in android ios; do
+            # GUARDA: só semeia histórico de plataforma que realmente rodou. Sem isto o
+            # `mkdir -p` abaixo RECRIA o diretório que o step de validação apagou, e o Allure
+            # gera um relatório de 0 testes com aba Trend — pior que nenhum relatório.
+            if [ ! -d "allure-results-$PLAT" ]; then
+              echo "Sem resultados $PLAT — histórico não semeado"
+              continue
+            fi
             SRC="reports-branch/$LATEST/$PLAT/history"
             if [ -n "$LATEST" ] && [ -d "$SRC" ]; then
               mkdir -p "allure-results-$PLAT/history"
@@ -313,6 +359,12 @@ jobs:
       - name: Re-encoda vídeos para H.264 (player do navegador)
         if: always()
         continue-on-error: true
+        # Teto do step: mesmo com -nostdin e timeout por arquivo, um lote grande não pode
+        # comer o orçamento inteiro do job.
+        timeout-minutes: 20
+        # Explícito porque o bloco abaixo usa process substitution (3< <(...)), que é bash,
+        # não POSIX sh — imune a uma futura mudança de defaults.run.shell neste arquivo.
+        shell: bash
         run: |
           # Normaliza TODOS os .mp4 para H.264 + faststart com bitrate limitado e downscale,
           # mantendo o mesmo nome (a referência no *-result.json continua válida). Motivos:
@@ -325,9 +377,18 @@ jobs:
           for PLAT in android ios; do
             SRC="allure-results-$PLAT"
             [ -d "$SRC" ] || continue
-            find "$SRC" -name "*.mp4" | while read -r f; do
-              codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null)
-              if ffmpeg -y -loglevel error -i "$f" \
+            # ARMADILHA (custou uma run de 4h05): sem -nostdin o ffmpeg herda a stdin do
+            # `while read` e ENGOLE a lista de arquivos do find; ao receber lixo binário cai no
+            # handler interativo ("Enter command: <target>|all <time>|-1 <command>[ <argument>]")
+            # e fica bloqueado para sempre. Três correções combinadas:
+            #   1) -nostdin             -> o ffmpeg não abre stdin;
+            #   2) lista no FD 3        -> mesmo que abrisse, não é a stdin do laço;
+            #   3) timeout 300 por arq. -> teto duro por arquivo, para qualquer travamento novo.
+            while IFS= read -r -u 3 f; do
+              # `|| true`: o run: roda com `bash -e`, e o ffprobe falha em .mp4 truncado —
+              # sem isso a atribuição derrubaria o step inteiro.
+              codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || true)
+              if timeout 300 ffmpeg -nostdin -y -loglevel error -i "$f" \
                    -vf "scale=-2:'min(1280,ih)'" \
                    -c:v libx264 -crf 28 -preset veryfast -maxrate 2M -bufsize 4M \
                    -pix_fmt yuv420p -an -movflags +faststart "${f}.tmp.mp4"; then
@@ -335,16 +396,18 @@ jobs:
                 echo "Re-encodado $f ($codec -> h264, <=720p/2Mbps)"
               else
                 rm -f "${f}.tmp.mp4"
-                echo "Falha ao re-encodar $f (codec $codec) — mantido original"
+                echo "::warning::Falha/timeout ao re-encodar $f (codec $codec) — mantido original"
               fi
-            done
+            done 3< <(find "$SRC" -type f -name '*.mp4')
           done
 
       - name: Gera os relatórios Allure HTML por plataforma
         run: |
           for PLAT in android ios; do
             SRC="allure-results-$PLAT"
-            if [ -d "$SRC" ] && [ "$(ls -A "$SRC" 2>/dev/null)" ]; then
+            # O step "Valida allure-results" já removeu diretórios sem *-result.json,
+            # então a existência do diretório é critério suficiente e correto aqui.
+            if [ -d "$SRC" ]; then
               allure generate "./$SRC" --clean -o "./allure-report-$PLAT"
               echo "Relatório $PLAT gerado"
             else
@@ -357,7 +420,7 @@ jobs:
         run: |
           for PLAT in android ios; do
             SRC="allure-results-$PLAT"
-            if [ -d "$SRC" ] && [ "$(ls -A "$SRC" 2>/dev/null)" ]; then
+            if [ -d "$SRC" ]; then
               allure generate "./$SRC" --clean --single-file -o "./allure-single-$PLAT"
               echo "Single-file $PLAT em ./allure-single-$PLAT/index.html"
             else
@@ -385,12 +448,19 @@ jobs:
 
       - name: Publica os relatórios na branch reports
         if: always()
+        timeout-minutes: 15
         run: |
-          RUN_DIR="run-${{ github.run_number }}-$(date -u +%Y-%m-%d)"
+          set -u
+
+          # Números das runs podadas, consumidos pelo step seguinte. Ficam em $RUNNER_TEMP,
+          # FORA de reports-branch/: qualquer arquivo dentro do checkout entraria no
+          # `git add -A` e seria commitado junto com o relatório.
+          PRUNED_LIST="$RUNNER_TEMP/pruned-runs.txt"
+          : > "$PRUNED_LIST"
 
           # --- Guarda: nada gerado -> não publica, mas explica claramente o motivo ---
           if [ ! -d "allure-report-android" ] && [ ! -d "allure-report-ios" ]; then
-            MSG="Device Farm não retornou allure-results (Android nem iOS) — relatório não publicado nesta run."
+            MSG="Nenhuma plataforma produziu *-result.json — relatório não publicado nesta run."
             echo "::warning::$MSG"
             echo "**Publicação:** $MSG" >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -399,6 +469,10 @@ jobs:
           cd reports-branch
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Estado do remoto conhecido neste momento (o checkout veio dele).
+          REMOTE_SHA="$(git rev-parse HEAD)"
+          BASE_TREE="$(git rev-parse HEAD^{tree})"
 
           # (Re)aplica a contribuição desta run sobre a árvore ATUAL da branch reports.
           # É idempotente: pode rodar de novo após re-sincronizar com o remoto.
@@ -413,10 +487,33 @@ jobs:
                 echo "Sem relatório $PLAT para copiar"
               fi
             done
+
+            # A mesma run republicada em outra data (re-run) não pode virar duas pastas.
+            for d in run-${{ github.run_number }}-*; do
+              [ -d "$d" ] || continue
+              [ "$d" = "$RUN_DIR" ] || { rm -rf "./$d"; echo "Removida duplicata da mesma run: $d"; }
+            done
+
+            # --- RETENÇÃO: mantém apenas os $KEEP runs mais recentes ---
+            # `sort -V` é OBRIGATÓRIO: em ordem lexicográfica run-100 viria ANTES de run-9,
+            # e a poda apagaria justamente os runs mais novos.
+            : > "$PRUNED_LIST"
+            find . -maxdepth 1 -type d -name 'run-*' -printf '%P\n' \
+              | sort -V | head -n "-$KEEP" | while IFS= read -r d; do
+                  [ -n "$d" ] || continue
+                  rm -rf "./$d"
+                  printf '%s\n' "$d" | sed -E 's/^run-([0-9]+)-.*/\1/' >> "$PRUNED_LIST"
+                  echo "Podado (retenção KEEP=$KEEP): $d"
+                done
+
+            # Roda DEPOIS da poda: o script varre o disco, então os runs removidos
+            # somem da tabela sem depender do JavaScript do cliente.
             node ../scripts/generate-report-index.mjs .
+
             # Remove anexos > 95MB (limite de 100MB por arquivo do GitHub).
             # Exclui .git/ — caso contrário o packfile (>95MB com vídeos acumulados)
             # é apagado e o git seguinte falha com "fatal: could not parse HEAD".
+            # O commit órfão NÃO dispensa isto: o limite é por blob da árvore nova.
             find . -path './.git' -prune -o -type f -size +95M -print0 | xargs -0 -r rm -f
           }
 
@@ -424,34 +521,134 @@ jobs:
           while true; do
             apply_changes
             git add -A
-            if git diff --staged --quiet; then
-              echo "Nada novo para publicar."
+
+            NEW_TREE="$(git write-tree)"
+            # "Nada novo" pelo HASH DA ÁRVORE: pergunta exatamente o que interessa — "a árvore
+            # que vou publicar é igual à que já está no remoto?" — sem depender de onde o HEAD
+            # aponta. `git diff --staged --quiet` só funciona enquanto o órfão for criado com
+            # `commit-tree` (HEAD continua válido); se um dia virar `git checkout --orphan`,
+            # o HEAD fica unborn, o diff passa a ser contra a árvore vazia e NUNCA fica vazio.
+            if [ "$NEW_TREE" = "$BASE_TREE" ]; then
+              echo "Nada novo para publicar (árvore idêntica à do remoto)."
               echo "**Publicação:** nada novo para publicar nesta run." >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
-            git commit -m "Relatório: $RUN_DIR"
-            if git push origin HEAD:reports; then
-              echo "Relatório publicado com sucesso."
-              echo "**Publicação:** relatório \`$RUN_DIR\` publicado na branch reports." >> "$GITHUB_STEP_SUMMARY"
+
+            # COMMIT ÓRFÃO: `commit-tree` SEM -p cria um commit raiz. Apagar pastas num commit
+            # normal não devolve espaço — os blobs de vídeo continuam alcançáveis pelo
+            # histórico. Com raiz + force push, o histórico antigo fica inalcançável e some
+            # do clone. Bônus: sem pai não existe fronteira shallow, então o fetch-depth: 1
+            # nunca dá "! [remote rejected] shallow update not allowed".
+            COMMIT="$(git commit-tree "$NEW_TREE" -m "Relatório: $RUN_DIR (retenção: últimos $KEEP runs)")"
+
+            # --force-with-lease com SHA EXPLÍCITO: --force puro sempre passaria e atropelaria
+            # em silêncio o relatório de uma run concorrente, tornando o retry abaixo código
+            # morto. A forma <ref>:<sha> é necessária porque o fetch-depth: 1 não deixa
+            # remote-tracking ref confiável para o lease implícito.
+            if git push --force-with-lease="refs/heads/reports:$REMOTE_SHA" \
+                        origin "$COMMIT:refs/heads/reports"; then
+              echo "Relatório publicado com sucesso (commit órfão $COMMIT)."
+              {
+                echo "**Publicação:** \`$RUN_DIR\` publicado na branch \`reports\` (commit órfão + force push)."
+                echo ""
+                echo "**Retenção:** mantendo os $KEEP runs mais recentes."
+                if [ -s "$PRUNED_LIST" ]; then
+                  echo ""
+                  echo "Runs podados nesta publicação:"
+                  while IFS= read -r RN; do echo "- run #$RN"; done < "$PRUNED_LIST"
+                else
+                  echo ""
+                  echo "Nenhum run podado nesta publicação."
+                fi
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
+
             n=$((n+1))
             if [ "$n" -ge 5 ]; then
               echo "::error::Falha ao publicar o relatório após 5 tentativas (push rejeitado pelo remoto)."
               echo "**Publicação:** FALHOU após 5 tentativas de push na branch reports." >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
+
             echo "Push rejeitado (corrida com outra run) — re-sincronizando com o remoto (tentativa $n/5)"
-            git fetch origin reports
+            git fetch --depth=1 origin reports
             git reset --hard FETCH_HEAD
+            # `reset --hard` NÃO remove untracked: sem o clean, sobras da tentativa anterior
+            # (ou de um estado remoto que deixou de existir) voltariam no `git add -A`.
+            git clean -ffdx
+            REMOTE_SHA="$(git rev-parse FETCH_HEAD)"
+            BASE_TREE="$(git rev-parse FETCH_HEAD^{tree})"
           done
+
+      - name: Apaga artifacts das runs podadas
+        if: always()
+        # Explícito: o bloco usa process substitution (< <(awk ...)), que é bash.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          # Este step NUNCA reprova o job: o relatório já foi publicado com sucesso.
+          # Toda falha vira ::warning::. Por isso `set +e` + `exit 0` explícito em vez de
+          # continue-on-error, que deixaria o step marcado em vermelho no histórico.
+          set +e
+
+          PRUNED_LIST="$RUNNER_TEMP/pruned-runs.txt"
+          ART="$RUNNER_TEMP/artifacts.tsv"
+
+          if [ ! -s "$PRUNED_LIST" ]; then
+            echo "Nenhuma run podada nesta execução — nada a apagar."
+            exit 0
+          fi
+
+          gh api --paginate -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | [.id, .name, .workflow_run.id] | @tsv' \
+            > "$ART"
+          if [ $? -ne 0 ] || [ ! -s "$ART" ]; then
+            echo "::warning::Não foi possível listar os artifacts do repositório — poda de artifacts ignorada."
+            exit 0
+          fi
+
+          DELETED=0
+          echo "**Artifacts apagados (runs podadas):**" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r N; do
+            [ -n "$N" ] || continue
+            # Casamento por NOME EXATO — nada de prefixo, senão podar a run 9 apagaria
+            # também os artifacts da run 90. Todos os artifacts deste workflow terminam
+            # em -<run_number>, o que torna o nome exato suficiente.
+            for NAME in "allure-results-android-$N" "allure-results-ios-$N" \
+                        "allure-report-android-$N"  "allure-report-ios-$N"; do
+              while IFS=$'\t' read -r ID RID; do
+                # Cinto e suspensório: jamais tocar nos artifacts da run atual.
+                [ "$RID" = "$CURRENT_RUN_ID" ] && continue
+                # `< /dev/null` pelo mesmo motivo do -nostdin no ffmpeg: este comando roda
+                # dentro de um `while read` e não pode consumir a lista que alimenta o laço.
+                if gh api -X DELETE "/repos/$REPO/actions/artifacts/$ID" --silent < /dev/null; then
+                  echo "- \`$NAME\` (id $ID)" >> "$GITHUB_STEP_SUMMARY"
+                  echo "Artifact removido: $NAME (id $ID)"
+                  DELETED=$((DELETED+1))
+                else
+                  echo "::warning::Falha ao apagar o artifact $NAME (id $ID) — segue o baile."
+                fi
+              done < <(awk -F'\t' -v n="$NAME" '$2==n {print $1 "\t" $3}' "$ART")
+            done
+          done < "$PRUNED_LIST"
+
+          if [ "$DELETED" -eq 0 ]; then
+            echo "- (nenhum — a retenção de 30 dias do Actions provavelmente já os expirou)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "Artifacts apagados: $DELETED"
+          exit 0
 
       - name: Imprime a URL do relatório
         run: |
           REPO="${{ github.repository }}"
           OWNER=$(echo $REPO | cut -d'/' -f1 | tr '[:upper:]' '[:lower:]')
           REPO_NAME=$(echo $REPO | cut -d'/' -f2)
-          RUN_DIR="run-${{ github.run_number }}-$(date -u +%Y-%m-%d)"
+          # RUN_DIR vem do $GITHUB_ENV — não recomputar (a data UTC pode ter virado).
           echo ""
           echo "1) Online (GitHub Pages):"
           echo "   Android: https://${OWNER}.github.io/${REPO_NAME}/${RUN_DIR}/android/"

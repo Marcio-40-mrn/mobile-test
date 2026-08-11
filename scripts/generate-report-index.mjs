@@ -5,14 +5,15 @@ import path from 'path';
 // Gera o index.html do branch `reports` (GitHub Pages) com abordagem HÍBRIDA.
 //
 // Build-time (aqui, no CI): a lista de runs é montada varrendo as pastas run-N em disco
-// (fs.readdirSync). O job publish-report faz checkout completo do branch reports e roda este
-// script a partir da raiz dele, então enxergamos todas as pastas run-N. As <tr> já saem
+// (fs.readdirSync). O job publish-report faz checkout da árvore atual do branch reports
+// (shallow, mas com todas as pastas run-N) e roda este script a partir da raiz dele. Como o
+// script roda DEPOIS da poda por retenção, os runs removidos já não aparecem. As <tr> saem
 // preenchidas no HTML — a tabela abre mesmo sem JavaScript, sem depender de API externa.
 //
 // Cliente (no navegador): um script enxuto faz apenas HEAD *same-origin* em cada link já
-// renderizado e esconde as linhas/células cuja pasta foi apagada manualmente. Como é
-// same-origin (servido pelo próprio Pages, com a sessão já autenticada), funciona em
-// repositório PRIVADO — reflete deleções ao vivo sem esperar o próximo run do CI.
+// renderizado e esconde as linhas/células cuja pasta não existe mais (deleção manual entre
+// dois runs do CI). Como é same-origin (servido pelo próprio Pages, com a sessão já
+// autenticada), funciona em repositório PRIVADO — reflete deleções ao vivo.
 //
 // Por que não usar a API do GitHub: a versão anterior chamava
 // https://api.github.com/repos/{owner}/{repo}/contents no cliente. Isso só funciona em repo
@@ -86,9 +87,10 @@ const html = `<!DOCTYPE html>
 </head>
 <body>
   <h1>Arys Mobile Tests — Relatórios Allure</h1>
-  <p>Todas as execuções de teste estão listadas abaixo, da mais recente para a mais antiga.
-     Os relatórios são gerados automaticamente após cada run no CI.
-     A exclusão é apenas manual — a lista abaixo reflete sempre os relatórios que ainda existem.</p>
+  <p>As execuções de teste estão listadas abaixo, da mais recente para a mais antiga.
+     Os relatórios são gerados automaticamente após cada run no CI e mantidos apenas para as
+     execuções mais recentes — as anteriores são removidas automaticamente para conter o
+     tamanho do repositório. A lista abaixo reflete sempre os relatórios que ainda existem.</p>
   ${entries.length === 0
     ? '<p class="empty">Nenhum relatório ainda. Execute o workflow para gerar o primeiro relatório.</p>'
     : `<table id="tbl">
