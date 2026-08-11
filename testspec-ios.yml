@@ -1,41 +1,43 @@
 version: 0.1
 
 # ============================================================================
-# testspec-ios.yml — GATED / AINDA NÃO PRONTO
+# testspec-ios.yml — job iOS (gated por run_ios=true em mobile_test.yml)
 # ----------------------------------------------------------------------------
-# O job iOS (mobile_test.yml) só roda por dispatch manual com run_ios=true.
-# Antes de considerá-lo funcional, faltam PRÉ-REQUISITOS:
+# Pré-requisitos ainda EXTERNOS a este repositório:
 #   1. Build EAS iOS gerando .ipa com distribution "internal" (o passo de
-#      download do workflow já busca --platform ios).
-#   2. wdio.conf.ts precisa de capabilities iOS: automationName "XCUITest"
-#      e bundleId, em vez de appPackage/appActivity (que são Android).
-#   3. Specs/selectors validados sob XCUITest — os XPath atuais foram escritos
-#      a partir de dumps UiAutomator2 (Android) e podem não casar no iOS.
-#   4. Confirmar o device pool iOS (DEVICE_FARM_IOS_DEVICE_POOL_ARN).
-# Notas de host: o Appium 2 no iOS exige `ios_test_host: macos_sequoia` +
-# DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH_V9. Avaliar na implementação real.
+#      download do workflow já busca --platform ios). O eas.json local é um
+#      stub — os perfis de build vivem no repositório do app.
+#   2. IOS_BUNDLE_ID: o bundle identifier não é derivável daqui (app.config.js
+#      não declara ios.bundleIdentifier). Precisa vir como environment variable
+#      do schedule-run. Sem ele, wdio.conf.ts falha cedo com mensagem clara.
+#   3. DEVICE_FARM_IOS_DEVICE_POOL_ARN apontando para um pool válido.
+#
+# Os seletores iOS em test/pages/ foram DERIVADOS das regras de tradução em
+# test/support/locator.ts e ainda não foram validados contra um device real.
+# Para coletar a árvore de UI e corrigi-los, rode com DUMP_SOURCE=true — o spec
+# test/specs/zz-dump-source.spec.ts grava pagesource-*.xml no $DEVICEFARM_LOG_DIR.
 # ============================================================================
+
+ios_test_host: macos_sequoia
 
 phases:
   install:
     commands:
-      # O host iOS vem com Node 14 por padrão, que quebra o WDIO 9. Usamos nvm
-      # para instalar o Node 18. O nvm NÃO persiste entre fases → o bloco se
-      # repete em install, pre_test e test.
-      - export NVM_DIR=$HOME/.nvm
-      - '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
-      - nvm install 18 && nvm use 18
+      # Mesma estratégia do testspec.yml (Android): o driver é instalado no
+      # APPIUM_HOME do host, não como dependência npm do pacote de testes.
+      # Se este host não expuser `devicefarm-cli`, o fallback é instalar o Node 18
+      # via nvm em cada fase (o nvm não persiste entre elas) e usar o Appium do host.
+      - devicefarm-cli use node 22
       - node --version
+      - devicefarm-cli use appium 3
       - appium --version
+      - appium driver install xcuitest
+      - export APPIUM_BASE_PATH=
       - cd $DEVICEFARM_TEST_PACKAGE_PATH
       - npm install --prefer-offline
 
   pre_test:
     commands:
-      - export NVM_DIR=$HOME/.nvm
-      - '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
-      - nvm use 18
-      - export APPIUM_BASE_PATH=
       - |-
         appium --base-path=$APPIUM_BASE_PATH --log-timestamp \
           --log-no-colors --relaxed-security --default-capabilities \
@@ -44,6 +46,7 @@ phases:
           \"appium:app\": \"$DEVICEFARM_APP_PATH\", \
           \"appium:udid\":\"$DEVICEFARM_DEVICE_UDID\", \
           \"appium:platformVersion\": \"$DEVICEFARM_DEVICE_OS_VERSION\", \
+          \"appium:derivedDataPath\": \"$DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH_V9\", \
           \"appium:automationName\": \"XCUITest\"}" \
           >> $DEVICEFARM_LOG_DIR/appium.log 2>&1 &
 
@@ -61,13 +64,15 @@ phases:
 
   test:
     commands:
-      - export NVM_DIR=$HOME/.nvm
-      - '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
-      - nvm use 18
+      - ls $DEVICEFARM_TEST_PACKAGE_PATH
       - cd $DEVICEFARM_TEST_PACKAGE_PATH
+      # Sinaliza a plataforma para wdio.conf.ts (capabilities XCUITest) e para a
+      # camada de seletores em test/support/platform.ts.
       - export PLATFORM=ios
-      # Materializa as credenciais injetadas pelo schedule-run (só nomes vão ao log).
-      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PIN=%s\n" "$TEST_USER_EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" > .env'
+      # Materializa as credenciais injetadas pelo schedule-run (--configuration
+      # environmentVariables) num .env local — o pacote nunca carrega segredos.
+      # Os valores não vão para o log: só os nomes das variáveis aparecem no comando.
+      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PIN=%s\nIOS_BUNDLE_ID=%s\n" "$TEST_USER_EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" "$IOS_BUNDLE_ID" > .env'
       - npm run wdio
 
   post_test:

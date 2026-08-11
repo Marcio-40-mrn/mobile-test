@@ -1,4 +1,3 @@
-import { Options } from '@wdio/types';
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
@@ -7,6 +6,8 @@ import allureReporter from '@wdio/allure-reporter';
 const allureCommandline: (args: string[]) => import('child_process').ChildProcess =
   require('allure-commandline');
 import 'dotenv/config';
+import { IS_IOS, ANDROID_APP_ID, requireIosBundleId } from './test/support/platform';
+import { BUILD_DEST } from './scripts/download-build';
 
 // ─── Detecção de ambiente ────────────────────────────────────────────────────
 // O AWS Device Farm injeta variáveis DEVICEFARM_* no host de teste. A presença
@@ -28,7 +29,7 @@ const SCREENSHOTS_DIR = isDeviceFarm
 const VIDEOS_DIR = isDeviceFarm
   ? LOG_DIR
   : path.join(process.cwd(), 'test', 'videos');
-const APK_PATH = 'C:\\dev\\apk_arys\\arys-latest.apk';
+const APK_PATH = BUILD_DEST.android;
 
 // Gera um nome de arquivo seguro (sem caracteres especiais) a partir do teste,
 // com timestamp — reutilizado por vídeo e screenshot.
@@ -41,26 +42,56 @@ function testFileBaseName(test: { fullName?: string; parent?: string; title?: st
 
 // ─── Capabilities ────────────────────────────────────────────────────────────
 // No Device Farm, deviceName/app/udid/platformVersion são fornecidos pelo Appium
-// via `--default-capabilities` no testspec.yml; aqui só declaramos o que não vem
-// de lá. Localmente apontamos o device fixo e o APK baixado do EAS.
-const baseCapability = {
+// via `--default-capabilities` no testspec; aqui só declaramos o que não vem de
+// lá. Localmente apontamos o device fixo e o APK baixado do EAS.
+//
+// iOS roda exclusivamente no Device Farm: XCUITest exige um host macOS, e a
+// máquina de desenvolvimento deste projeto é Windows.
+const androidCapability = {
   platformName: 'Android',
   'appium:automationName': 'UiAutomator2',
-  'appium:appPackage': 'com.aramis.arys',
-  'appium:appActivity': 'com.aramis.arys.MainActivity',
+  'appium:appPackage': ANDROID_APP_ID,
+  'appium:appActivity': `${ANDROID_APP_ID}.MainActivity`,
   'appium:noReset': true,
 };
 
 const localCapability = {
-  ...baseCapability,
+  ...androidCapability,
   'appium:deviceName': 'S25Ultra_API35',
   'appium:app': APK_PATH,
   'appium:enforceAppInstall': true,
 };
 
+function buildIosCapability() {
+  if (!isDeviceFarm) {
+    throw new Error(
+      '[wdio] PLATFORM=ios só é suportado no AWS Device Farm (XCUITest exige host macOS). ' +
+        'Rode via workflow_dispatch de mobile_test.yml com run_ios=true.',
+    );
+  }
+  return {
+    platformName: 'iOS',
+    'appium:automationName': 'XCUITest',
+    'appium:bundleId': requireIosBundleId(),
+    'appium:noReset': true,
+    // Absorve os alertas nativos de permissão (notificações, contatos), que no
+    // Android não aparecem porque o fluxo cancela o modal do app antes.
+    'appium:autoAcceptAlerts': true,
+    // O WebDriverAgent precisa ser compilado/assinado no primeiro boot do host.
+    'appium:wdaLaunchTimeout': 240000,
+    'appium:wdaConnectionTimeout': 240000,
+  };
+}
+
+const capability = IS_IOS
+  ? buildIosCapability()
+  : isDeviceFarm
+    ? androidCapability
+    : localCapability;
+
 // ─── Reporters ───────────────────────────────────────────────────────────────
 // html-nice só faz sentido em execução local; no Device Farm publicamos via Allure.
-const reporters: Options.Testrunner['reporters'] = ['spec'];
+const reporters: WebdriverIO.Config['reporters'] = ['spec'];
 if (!isDeviceFarm) {
   reporters.push([
     'html-nice',
@@ -83,26 +114,25 @@ reporters.push([
   },
 ]);
 
-export const config: Options.Testrunner = {
+export const config: WebdriverIO.Config = {
   runner: 'local',
-  autoCompileOpts: {
-    autoCompile: true,
-    tsNodeOpts: {
-      project: './tsconfig.json',
-      transpileOnly: true,
-    },
-  },
+  // `autoCompileOpts` foi removido no WDIO 8 e nenhum pacote da v9 o lê — o
+  // runner detecta e registra o TypeScript sozinho a partir do tsconfig.json.
 
-  specs: [
-    './test/specs/00-update-check.spec.ts',
-    './test/specs/login.spec.ts',
-    './test/specs/home.spec.ts',
-    './test/specs/clientes.spec.ts',
-  ],
+  // DUMP_SOURCE=true troca a suíte inteira pelo spec de coleta de page source,
+  // usado para descobrir os seletores reais de uma plataforma ainda não mapeada.
+  specs: process.env.DUMP_SOURCE === 'true'
+    ? ['./test/specs/zz-dump-source.spec.ts']
+    : [
+        './test/specs/00-update-check.spec.ts',
+        './test/specs/login.spec.ts',
+        './test/specs/home.spec.ts',
+        './test/specs/clientes.spec.ts',
+      ],
 
   maxInstances: 1,
 
-  capabilities: [isDeviceFarm ? baseCapability : localCapability],
+  capabilities: [capability],
 
   logLevel: 'warn',
   bail: 0,
@@ -126,10 +156,13 @@ export const config: Options.Testrunner = {
   },
 
   onPrepare: async function () {
-    // No Device Farm o APK já é instalado no device pelo próprio serviço.
+    // No Device Farm o app já é instalado no device pelo próprio serviço.
     if (isDeviceFarm) return;
 
     fs.rmSync(ALLURE_RESULTS_DIR, { recursive: true, force: true });
+    // O download/install local é específico de Android (EAS APK + adb); iOS não
+    // tem caminho local — buildIosCapability() já teria falhado antes daqui.
+    if (IS_IOS) return;
     if (process.env.SKIP_DOWNLOAD === 'true') return;
 
     const { downloadLatestBuild } = await import('./scripts/download-build');
@@ -143,7 +176,7 @@ export const config: Options.Testrunner = {
     // Inicia a gravação de tela. Envolto em try/catch para que uma falha na
     // gravação nunca derrube o teste em si.
     try {
-      if (isDeviceFarm) {
+      if (isDeviceFarm && !IS_IOS) {
         // No Device Farm Android o screenrecord nativo (startRecordingScreen)
         // trunca o vídeo em ~37s na troca de surface do app. MediaProjection
         // sobrevive a isso e grava a sessão inteira.
@@ -159,7 +192,14 @@ export const config: Options.Testrunner = {
           priority: 'high',
         });
       } else {
-        await driver.startRecordingScreen({ timeLimit: '180' });
+        // MediaProjection é exclusivo do UiAutomator2. No iOS o XCUITest grava
+        // via startRecordingScreen; `videoType`/`videoQuality` mantêm o arquivo
+        // em h264 (o default MJPEG do WDA não toca em <video> no navegador).
+        await driver.startRecordingScreen(
+          IS_IOS
+            ? { timeLimit: '600', videoType: 'libx264', videoQuality: 'medium', videoFps: 10 }
+            : { timeLimit: '180' },
+        );
       }
     } catch (e) {
       console.warn('[video] Falha ao iniciar gravação:', e);
@@ -171,7 +211,7 @@ export const config: Options.Testrunner = {
 
     // 1. Vídeo — sempre (todos os testes, passando ou falhando).
     try {
-      const base64 = (isDeviceFarm
+      const base64 = (isDeviceFarm && !IS_IOS
         ? await driver.execute('mobile: stopMediaProjectionRecording')
         : await driver.stopRecordingScreen()) as string;
       if (base64) {

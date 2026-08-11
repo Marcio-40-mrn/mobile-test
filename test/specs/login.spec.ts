@@ -2,8 +2,7 @@ import { loginPage, EMAIL, SENHA, PIN } from '../pages/login.page';
 
 describe('Login', () => {
   before(async () => {
-    await driver.execute('mobile: clearApp', { appId: 'com.aramis.arys' });
-    await driver.activateApp('com.aramis.arys');
+    await loginPage.resetApp();
     await browser.pause(5000); // splash screen — no observable element signals readiness
     await loginPage.dismissUpdatePopupIfPresent();
   });

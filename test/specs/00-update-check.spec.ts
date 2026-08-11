@@ -1,10 +1,10 @@
 import { loginPage } from '../pages/login.page';
+import { APP_ID } from '../support/platform';
 
 describe('Update Check', () => {
   it('deve verificar e aplicar atualização disponível', async () => {
-    await driver.terminateApp('com.aramis.arys');
-    await driver.execute('mobile: clearApp', { appId: 'com.aramis.arys' });
-    await driver.activateApp('com.aramis.arys');
+    await driver.terminateApp(APP_ID);
+    await loginPage.resetApp();
     await browser.pause(5000); // splash screen — no observable element signals readiness
 
     await loginPage.dismissUpdatePopupIfPresent();

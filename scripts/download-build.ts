@@ -5,7 +5,13 @@ import fs from 'fs';
 import path from 'path';
 import 'dotenv/config';
 
-const APK_DEST = 'C:\\dev\\apk_arys\\arys-latest.apk';
+export type BuildPlatform = 'android' | 'ios';
+
+/** Destino local do artefato por plataforma. Reexportado para o wdio.conf.ts. */
+export const BUILD_DEST: Record<BuildPlatform, string> = {
+  android: 'C:\\dev\\apk_arys\\arys-latest.apk',
+  ios: 'C:\\dev\\apk_arys\\arys-latest.ipa',
+};
 
 interface ExpoBuild {
   id: string;
@@ -15,32 +21,37 @@ interface ExpoBuild {
   artifacts?: { buildUrl?: string };
 }
 
-export function parseLatestBuildUrl(builds: ExpoBuild[]): string {
+export function parseLatestBuildUrl(
+  builds: ExpoBuild[],
+  platform: BuildPlatform = 'android',
+): string {
   const build = builds.find(
     b =>
       b.status === 'FINISHED' &&
-      b.platform?.toLowerCase() === 'android' &&
+      b.platform?.toLowerCase() === platform &&
       b.distribution?.toLowerCase() === 'internal' &&
       b.artifacts?.buildUrl
   );
   if (!build?.artifacts?.buildUrl) {
-    throw new Error('[download-build] Nenhuma build Android INTERNAL finalizada encontrada');
+    throw new Error(
+      `[download-build] Nenhuma build ${platform === 'ios' ? 'iOS' : 'Android'} INTERNAL finalizada encontrada`,
+    );
   }
   return build.artifacts.buildUrl;
 }
 
-export async function downloadLatestBuild(): Promise<void> {
+export async function downloadLatestBuild(platform: BuildPlatform = 'android'): Promise<void> {
   const token = process.env.EXPO_TOKEN;
   if (!token) {
     throw new Error('[download-build] EXPO_TOKEN não encontrado no .env');
   }
 
-  console.log('[download-build] Buscando builds Android...');
+  console.log(`[download-build] Buscando builds ${platform}...`);
 
   let output: string;
   try {
     output = execSync(
-      'eas build:list --platform android --limit 5 --json --non-interactive',
+      `eas build:list --platform ${platform} --limit 5 --json --non-interactive`,
       { env: { ...process.env, EXPO_TOKEN: token }, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
     );
   } catch (err: any) {
@@ -49,22 +60,24 @@ export async function downloadLatestBuild(): Promise<void> {
   }
 
   const builds: ExpoBuild[] = JSON.parse(output);
-  const url = parseLatestBuildUrl(builds);
+  const url = parseLatestBuildUrl(builds, platform);
 
   console.log('[download-build] Baixando build...');
 
-  const dir = path.dirname(APK_DEST);
+  const dest = BUILD_DEST[platform];
+  const dir = path.dirname(dest);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
 
-  await downloadFile(url, APK_DEST);
+  await downloadFile(url, dest);
 
   console.log('[download-build] Concluído.');
 }
 
 if (require.main === module) {
-  downloadLatestBuild().catch((e: Error) => { console.error(e.message); process.exit(1); });
+  const platform = (process.argv[2] ?? 'android') as BuildPlatform;
+  downloadLatestBuild(platform).catch((e: Error) => { console.error(e.message); process.exit(1); });
 }
 
 function downloadFile(url: string, dest: string, redirectCount = 0): Promise<void> {
