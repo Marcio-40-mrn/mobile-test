@@ -1,5 +1,28 @@
 import { L, byText, PlatformSelector } from '../support/locator';
-import { ANDROID_APP_ID, requireIosBundleId } from '../support/platform';
+import { ANDROID_APP_ID, IOS_BUNDLE_ID } from '../support/platform';
+
+/**
+ * Bundle identifier do app iOS em runtime.
+ *
+ * No CI ele vem de `IOS_BUNDLE_ID` (secret). Na sessão remota aberta manualmente
+ * o app é identificado por caminho (`appium:app`), não por bundle id — mas o
+ * XCUITest reporta o bundle id de volta nas capabilities da sessão. Preferir a
+ * env var e cair para o valor reportado evita exigir uma quarta variável no
+ * fluxo local, que já pede host, porta e caminho a cada nova sessão.
+ */
+function resolveIosBundleId(caps: Record<string, unknown>): string {
+  const reportado = (caps['appium:bundleId'] ?? caps['bundleId'] ?? caps['CFBundleIdentifier']) as
+    | string
+    | undefined;
+  const bundleId = IOS_BUNDLE_ID || reportado;
+  if (!bundleId) {
+    throw new Error(
+      '[base.page] Não foi possível determinar o bundle id do app iOS: IOS_BUNDLE_ID não ' +
+        'está definido e a sessão não reportou um. Defina IOS_BUNDLE_ID no .env.',
+    );
+  }
+  return bundleId;
+}
 
 export class BasePage {
   // ─── Seletores compartilhados ──────────────────────────────────────────────
@@ -121,16 +144,20 @@ export class BasePage {
    * Reinicia o app com estado limpo.
    *
    * Android: `mobile: clearApp` apaga os dados sem reinstalar. O XCUITest não tem
-   * equivalente, então no iOS removemos e reinstalamos o app — o caminho do .ipa
-   * vem da capability `appium:app`, injetada pelo Device Farm via `$DEVICEFARM_APP_PATH`.
+   * equivalente, então no iOS removemos e reinstalamos o app.
+   *
+   * O caminho do .ipa vem da capability `appium:app` — no Device Farm ela é
+   * injetada via `$DEVICEFARM_APP_PATH`, e na sessão remota local vem de
+   * `REMOTE_PATH_IOS`. Quando o app foi aberto por bundle id e não por caminho,
+   * `appPath` fica indefinido e o reset degrada para terminate + activate.
    */
   async resetApp(): Promise<void> {
     if (driver.isIOS) {
-      const bundleId = requireIosBundleId();
       // O Device Farm injeta o .ipa via `appium:app`; o servidor pode devolver a
       // capability negociada com ou sem o prefixo, então aceitamos as duas formas.
       const caps = driver.capabilities as Record<string, unknown>;
       const appPath = (caps['appium:app'] ?? caps['app']) as string | undefined;
+      const bundleId = resolveIosBundleId(caps);
       await driver.terminateApp(bundleId);
       if (appPath) {
         await driver.removeApp(bundleId);

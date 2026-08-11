@@ -8,16 +8,20 @@ import { PLATFORM } from '../support/platform';
 /**
  * Coleta de page source — ferramenta de descoberta, não teste de regressão.
  *
- * Rodado com `DUMP_SOURCE=true`, este spec substitui a suíte inteira (ver
- * `specs` no wdio.conf.ts) e grava a árvore de UI de cada tela como artifact.
- * Existe porque os seletores iOS deste repositório foram *derivados* das regras
- * de tradução em `test/support/locator.ts`, sem nunca terem sido validados
- * contra um device real — e não há Mac disponível para inspecionar localmente.
+ * NÃO faz parte da suíte e NÃO roda no CI. É acionado sob demanda:
  *
- * Uso:
- *   1. workflow_dispatch de mobile_test.yml com run_ios=true e DUMP_SOURCE=true
- *   2. baixar o artifact do $DEVICEFARM_LOG_DIR
- *   3. abrir os pagesource-*.xml e corrigir as entradas `ios:` dos page objects
+ *   npm run dump:ios       — contra a sessão aberta no Device Farm (REMOTE_*)
+ *   npm run dump:android   — contra o AVD local
+ *
+ * Grava a árvore de UI de cada tela em `reports/pagesource/` (ou no
+ * $DEVICEFARM_LOG_DIR, se por algum motivo rodar lá). Serve para conferir os
+ * seletores de uma plataforma contra a realidade — os do iOS, em particular,
+ * foram *derivados* das regras de tradução em `test/support/locator.ts` e
+ * precisam ser confirmados contra um device.
+ *
+ * Depois de rodar: abra os `pagesource-*.xml` e corrija as entradas `ios:` dos
+ * page objects. Para inspeção interativa, a mesma sessão remota serve ao Appium
+ * Inspector — este spec é o caminho automatizado equivalente.
  *
  * Cada etapa é isolada em try/catch: se o login falhar por seletor errado, o
  * dump da tela de login — que é justamente o que se precisa para corrigi-lo —

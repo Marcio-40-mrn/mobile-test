@@ -6,7 +6,12 @@ import allureReporter from '@wdio/allure-reporter';
 const allureCommandline: (args: string[]) => import('child_process').ChildProcess =
   require('allure-commandline');
 import 'dotenv/config';
-import { IS_IOS, ANDROID_APP_ID, requireIosBundleId } from './test/support/platform';
+import {
+  IS_IOS,
+  ANDROID_APP_ID,
+  requireIosBundleId,
+  requireRemoteIosSession,
+} from './test/support/platform';
 import { BUILD_DEST } from './scripts/download-build';
 
 // ─── Detecção de ambiente ────────────────────────────────────────────────────
@@ -41,12 +46,14 @@ function testFileBaseName(test: { fullName?: string; parent?: string; title?: st
 }
 
 // ─── Capabilities ────────────────────────────────────────────────────────────
-// No Device Farm, deviceName/app/udid/platformVersion são fornecidos pelo Appium
-// via `--default-capabilities` no testspec; aqui só declaramos o que não vem de
-// lá. Localmente apontamos o device fixo e o APK baixado do EAS.
-//
-// iOS roda exclusivamente no Device Farm: XCUITest exige um host macOS, e a
-// máquina de desenvolvimento deste projeto é Windows.
+// Três alvos de execução:
+//   1. Android local      — AVD nesta máquina, APK baixado do EAS
+//   2. Android/iOS no CI  — AWS Device Farm; deviceName/app/udid/platformVersion
+//                           vêm do Appium via `--default-capabilities` no testspec
+//   3. iOS local          — sessão aberta manualmente no Device Farm; conectamos
+//                           no Appium dela (REMOTE_HOST/REMOTE_PORT), com o app em
+//                           REMOTE_PATH_IOS. XCUITest exige host macOS, então não
+//                           há Appium local envolvido.
 const androidCapability = {
   platformName: 'Android',
   'appium:automationName': 'UiAutomator2',
@@ -62,29 +69,27 @@ const localCapability = {
   'appium:enforceAppInstall': true,
 };
 
-function buildIosCapability() {
-  if (!isDeviceFarm) {
-    throw new Error(
-      '[wdio] PLATFORM=ios só é suportado no AWS Device Farm (XCUITest exige host macOS). ' +
-        'Rode via workflow_dispatch de mobile_test.yml com run_ios=true.',
-    );
-  }
-  return {
-    platformName: 'iOS',
-    'appium:automationName': 'XCUITest',
-    'appium:bundleId': requireIosBundleId(),
-    'appium:noReset': true,
-    // Absorve os alertas nativos de permissão (notificações, contatos), que no
-    // Android não aparecem porque o fluxo cancela o modal do app antes.
-    'appium:autoAcceptAlerts': true,
-    // O WebDriverAgent precisa ser compilado/assinado no primeiro boot do host.
-    'appium:wdaLaunchTimeout': 240000,
-    'appium:wdaConnectionTimeout': 240000,
-  };
-}
+const iosBaseCapability = {
+  platformName: 'iOS',
+  'appium:automationName': 'XCUITest',
+  'appium:noReset': true,
+  // Absorve os alertas nativos de permissão (notificações, contatos), que no
+  // Android não aparecem porque o fluxo cancela o modal do app antes.
+  'appium:autoAcceptAlerts': true,
+  // O WebDriverAgent precisa ser compilado/assinado no primeiro boot do host.
+  'appium:wdaLaunchTimeout': 240000,
+  'appium:wdaConnectionTimeout': 240000,
+};
+
+// Sessão remota: o app já está no device da sessão, identificado pelo caminho.
+// `bundleId` não é exigido aqui — o XCUITest o reporta de volta na sessão, e
+// BasePage.resetApp() usa esse valor quando IOS_BUNDLE_ID não está definido.
+const remoteIosSession = IS_IOS && !isDeviceFarm ? requireRemoteIosSession() : null;
 
 const capability = IS_IOS
-  ? buildIosCapability()
+  ? remoteIosSession
+    ? { ...iosBaseCapability, 'appium:app': remoteIosSession.app }
+    : { ...iosBaseCapability, 'appium:bundleId': requireIosBundleId() }
   : isDeviceFarm
     ? androidCapability
     : localCapability;
@@ -119,10 +124,10 @@ export const config: WebdriverIO.Config = {
   // `autoCompileOpts` foi removido no WDIO 8 e nenhum pacote da v9 o lê — o
   // runner detecta e registra o TypeScript sozinho a partir do tsconfig.json.
 
-  // DUMP_SOURCE=true troca a suíte inteira pelo spec de coleta de page source,
-  // usado para descobrir os seletores reais de uma plataforma ainda não mapeada.
+  // DUMP_SOURCE=true troca a suíte inteira pelo spec de coleta de page source.
+  // Não é acionado pelo CI: use `npm run dump:ios` / `npm run dump:android`.
   specs: process.env.DUMP_SOURCE === 'true'
-    ? ['./test/specs/zz-dump-source.spec.ts']
+    ? ['./test/specs/dump-source.spec.ts']
     : [
         './test/specs/00-update-check.spec.ts',
         './test/specs/login.spec.ts',
@@ -141,8 +146,10 @@ export const config: WebdriverIO.Config = {
   connectionRetryTimeout: 120000,
   connectionRetryCount: 3,
 
-  // No Device Farm o Appium é iniciado externamente; localmente usamos o service.
-  services: isDeviceFarm
+  // O appium service só sobe um servidor local no alvo Android local. No Device
+  // Farm o Appium é iniciado pelo testspec, e na sessão iOS remota ele já está no
+  // ar no host da sessão.
+  services: isDeviceFarm || remoteIosSession
     ? []
     : [['appium', { command: 'appium', args: { relaxedSecurity: true } }]],
 
@@ -280,11 +287,18 @@ export const config: WebdriverIO.Config = {
   },
 };
 
-// No Device Farm o Appium já está no ar (subido pelo testspec.yml na fase pre_test)
-// em localhost:4723; apontamos o WDIO para ele. Localmente, o appium service
-// gerencia host/porta automaticamente, então nada é setado aqui.
+// No Device Farm o Appium já está no ar (subido pelo testspec na fase pre_test)
+// em localhost:4723; apontamos o WDIO para ele. No alvo Android local o appium
+// service gerencia host/porta automaticamente, então nada é setado.
 if (isDeviceFarm) {
   config.hostname = 'localhost';
   config.port = 4723;
   config.path = '/';
+} else if (remoteIosSession) {
+  config.hostname = remoteIosSession.host;
+  config.port = remoteIosSession.port;
+  // Se o endpoint da sessão do Device Farm incluir um base path (ex.: /wd/hub),
+  // é aqui que ele entra — a sessão atual assume a raiz.
+  config.path = '/';
+  config.protocol = remoteIosSession.port === 443 ? 'https' : 'http';
 }

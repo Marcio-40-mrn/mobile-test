@@ -7,7 +7,8 @@ name: Mobile E2E — AWS Device Farm
 #   test/support/locator.ts), mas os seletores iOS foram derivados das regras de
 #   tradução e ainda não foram validados contra um device real. Faltam também:
 #   build EAS iOS (.ipa internal) e o secret IOS_BUNDLE_ID. Por isso não roda em PRs.
-#   Use dump_source=true para coletar a árvore de UI e corrigir os seletores.
+#   Para inspecionar a árvore de elementos, use `npm run dump:ios` localmente contra
+#   uma sessão aberta no Device Farm — não há coleta de page source neste pipeline.
 # O job `setup` monta a matrix dinamicamente para aplicar esse gate.
 
 on:
@@ -16,10 +17,6 @@ on:
     inputs:
       run_ios:
         description: "Rodar também o job iOS (experimental — ainda não pronto)"
-        type: boolean
-        default: false
-      dump_source:
-        description: "Coletar page source em vez de rodar a suíte (descoberta de seletores)"
         type: boolean
         default: false
 
@@ -91,7 +88,11 @@ jobs:
             --status finished --distribution internal --json --non-interactive)
           URL=$(echo "$BUILD_JSON" | jq -r '.[0].artifacts.buildUrl // empty')
           if [ -z "$URL" ]; then
-            echo "::error::Nenhuma build ${{ matrix.platform }} INTERNAL finalizada encontrada no EAS."
+            if [ "${{ matrix.platform }}" = "ios" ]; then
+              echo "::error::Nenhuma build iOS INTERNAL finalizada no EAS. Pré-requisitos, todos fora deste repositório: (1) perfil de build com distribution 'internal' no eas.json do repositório do app — o eas.json daqui é um stub; (2) conta Apple Developer com provisionamento (o Device Farm re-assina o .ipa, mas build de simulador .app não serve); (3) secret IOS_BUNDLE_ID configurado."
+            else
+              echo "::error::Nenhuma build Android INTERNAL finalizada encontrada no EAS."
+            fi
             exit 1
           fi
           curl -sSL --retry 3 -o "${{ steps.vars.outputs.app_file }}" "$URL"
@@ -133,8 +134,8 @@ jobs:
           TEST_USER_PIN: ${{ secrets.TEST_USER_PIN }}
           # Bundle identifier do app iOS: não é derivável do repositório de testes
           # (app.config.js não declara ios.bundleIdentifier), então vem de secret.
+          # Vazio no job Android — o filtro no ENV_JSON abaixo o descarta.
           IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
-          DUMP_SOURCE: ${{ inputs.dump_source && 'true' || '' }}
         run: |
           set -euo pipefail
 
@@ -172,21 +173,23 @@ jobs:
           SPEC_ARN=$(upload "spec-${RUN_NUMBER}.yml" APPIUM_NODE_TEST_SPEC "$TESTSPEC")
 
           # Injeta as credenciais como environmentVariables — o testspec as materializa em .env.
-          # IOS_BUNDLE_ID e DUMP_SOURCE só têm efeito no job iOS (ver testspec-ios.yml);
-          # no Android ficam como strings vazias e são ignorados.
+          #
+          # O map(select(...)) no final NÃO é cosmético: a API do Device Farm valida
+          # `min length: 1` em environmentVariables[].value e rejeita o schedule-run
+          # inteiro se qualquer valor vier vazio (ParamValidation). IOS_BUNDLE_ID é
+          # vazio em todo job Android, então enviá-lo derrubava o CI Android.
+          # O filtro também evita que um secret ausente produza o mesmo erro críptico.
           ENV_JSON=$(jq -nc \
             --arg email  "$TEST_USER_EMAIL" \
             --arg pass   "$TEST_USER_PASSWORD" \
             --arg pin    "$TEST_USER_PIN" \
             --arg bundle "$IOS_BUNDLE_ID" \
-            --arg dump   "$DUMP_SOURCE" \
-            '{environmentVariables:[
-              {name:"TEST_USER_EMAIL",value:$email},
-              {name:"TEST_USER_PASSWORD",value:$pass},
-              {name:"TEST_USER_PIN",value:$pin},
-              {name:"IOS_BUNDLE_ID",value:$bundle},
-              {name:"DUMP_SOURCE",value:$dump}
-            ]}')
+            '{environmentVariables:
+               [ {name:"TEST_USER_EMAIL",    value:$email},
+                 {name:"TEST_USER_PASSWORD", value:$pass},
+                 {name:"TEST_USER_PIN",      value:$pin},
+                 {name:"IOS_BUNDLE_ID",      value:$bundle}
+               ] | map(select(.value != ""))}')
 
           TEST_JSON=$(jq -nc \
             --arg tp "$TEST_ARN" --arg ts "$SPEC_ARN" \
