@@ -15,29 +15,12 @@ export const IS_IOS = PLATFORM === 'ios';
 /** Package Android — declarado também como `appium:appPackage` no wdio.conf.ts. */
 export const ANDROID_APP_ID = 'com.aramis.arys';
 
-/**
- * Bundle identifier do app iOS.
- *
- * Não existe fonte de verdade para esse valor neste repositório: `app.config.js`
- * não declara `ios.bundleIdentifier`, e o `eas.json` local é um stub sem perfis
- * de build. Até que o time do app o confirme, ele vem do ambiente — o job iOS
- * falha cedo e com mensagem clara se não vier (ver `requireIosBundleId`).
- */
-export const IOS_BUNDLE_ID = process.env.IOS_BUNDLE_ID ?? '';
-
-export function requireIosBundleId(): string {
-  if (!IOS_BUNDLE_ID) {
-    throw new Error(
-      '[platform] IOS_BUNDLE_ID não definido. O bundle identifier do app iOS não é ' +
-        'derivável deste repositório (app.config.js não declara ios.bundleIdentifier). ' +
-        'Defina-o no .env local ou como environment variable do run no Device Farm.',
-    );
-  }
-  return IOS_BUNDLE_ID;
-}
-
-/** Identificador do app na plataforma corrente — usado por clearApp/activateApp/terminateApp. */
-export const APP_ID = IS_IOS ? IOS_BUNDLE_ID : ANDROID_APP_ID;
+// Não há constante de bundle identifier para o iOS, e isso é intencional: nos
+// dois alvos o app é identificado por CAMINHO, não por id. No Device Farm o
+// testspec passa `appium:app = $DEVICEFARM_APP_PATH`; na sessão remota usamos
+// REMOTE_PATH_IOS. Quando um bundle id é realmente necessário (remover/reinstalar
+// o app em BasePage.resetApp), ele é lido das capabilities que a própria sessão
+// XCUITest reporta.
 
 // ─── Sessão iOS remota (execução local) ──────────────────────────────────────
 // Não há como rodar XCUITest a partir do Windows. Para desenvolver e depurar

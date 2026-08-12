@@ -5,10 +5,9 @@ name: Mobile E2E — AWS Device Farm
 # - iOS: GATED — só roda via dispatch manual com run_ios=true. A suíte já é
 #   cross-platform (capabilities XCUITest no wdio.conf.ts + camada de seletores em
 #   test/support/locator.ts), mas os seletores iOS foram derivados das regras de
-#   tradução e ainda não foram validados contra um device real. Faltam também:
-#   build EAS iOS (.ipa internal) e o secret IOS_BUNDLE_ID. Por isso não roda em PRs.
-#   Para inspecionar a árvore de elementos, use `npm run dump:ios` localmente contra
-#   uma sessão aberta no Device Farm — não há coleta de page source neste pipeline.
+#   tradução e ainda não foram validados contra um device real. Por isso não roda
+#   em PRs. Para inspecionar a árvore de elementos, use `npm run dump:ios`
+#   localmente contra uma sessão aberta no Device Farm.
 # O job `setup` monta a matrix dinamicamente para aplicar esse gate.
 
 on:
@@ -83,13 +82,28 @@ jobs:
           EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
         run: |
           set -euo pipefail
-          echo "Buscando build ${{ matrix.platform }} INTERNAL finalizada..."
-          BUILD_JSON=$(eas build:list --platform "${{ matrix.platform }}" --limit 1 \
-            --status finished --distribution internal --json --non-interactive)
-          URL=$(echo "$BUILD_JSON" | jq -r '.[0].artifacts.buildUrl // empty')
+          if [ "${{ matrix.platform }}" = "ios" ]; then
+            # As builds iOS do projeto saem do perfil `production`, cuja distribution
+            # é `store` — filtrar por `internal` (como no Android) as excluía e o job
+            # não achava build nenhuma. Aqui só descartamos builds de SIMULADOR, que
+            # geram .app/.tar.gz e não instalam em device real; store e internal
+            # servem, porque o Device Farm re-assina o .ipa.
+            echo "Buscando build iOS finalizada (qualquer distribution exceto simulator)..."
+            BUILD_JSON=$(eas build:list --platform ios --limit 10 \
+              --status finished --json --non-interactive)
+            echo "$BUILD_JSON" | jq -r '.[] | "  - \(.id) distribution=\(.distribution // "?") artifacts=\(if .artifacts.buildUrl then "sim" else "não" end)"'
+            URL=$(echo "$BUILD_JSON" | jq -r '
+              [ .[] | select((.distribution // "" | ascii_downcase) != "simulator")
+                    | select(.artifacts.buildUrl) ][0].artifacts.buildUrl // empty')
+          else
+            echo "Buscando build Android INTERNAL finalizada..."
+            BUILD_JSON=$(eas build:list --platform android --limit 1 \
+              --status finished --distribution internal --json --non-interactive)
+            URL=$(echo "$BUILD_JSON" | jq -r '.[0].artifacts.buildUrl // empty')
+          fi
           if [ -z "$URL" ]; then
             if [ "${{ matrix.platform }}" = "ios" ]; then
-              echo "::error::Nenhuma build iOS INTERNAL finalizada no EAS. Pré-requisitos, todos fora deste repositório: (1) perfil de build com distribution 'internal' no eas.json do repositório do app — o eas.json daqui é um stub; (2) conta Apple Developer com provisionamento (o Device Farm re-assina o .ipa, mas build de simulador .app não serve); (3) secret IOS_BUNDLE_ID configurado."
+              echo "::error::Nenhuma build iOS instalável encontrada no EAS (a listagem acima mostra o que existe). É preciso uma build finalizada, com artifact, que não seja de simulador."
             else
               echo "::error::Nenhuma build Android INTERNAL finalizada encontrada no EAS."
             fi
@@ -132,10 +146,6 @@ jobs:
           TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
           TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
           TEST_USER_PIN: ${{ secrets.TEST_USER_PIN }}
-          # Bundle identifier do app iOS: não é derivável do repositório de testes
-          # (app.config.js não declara ios.bundleIdentifier), então vem de secret.
-          # Vazio no job Android — o filtro no ENV_JSON abaixo o descarta.
-          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
         run: |
           set -euo pipefail
 
@@ -173,23 +183,17 @@ jobs:
           SPEC_ARN=$(upload "spec-${RUN_NUMBER}.yml" APPIUM_NODE_TEST_SPEC "$TESTSPEC")
 
           # Injeta as credenciais como environmentVariables — o testspec as materializa em .env.
-          #
-          # O map(select(...)) no final NÃO é cosmético: a API do Device Farm valida
-          # `min length: 1` em environmentVariables[].value e rejeita o schedule-run
-          # inteiro se qualquer valor vier vazio (ParamValidation). IOS_BUNDLE_ID é
-          # vazio em todo job Android, então enviá-lo derrubava o CI Android.
-          # O filtro também evita que um secret ausente produza o mesmo erro críptico.
+          # Só variáveis com valor entram aqui: a API do Device Farm valida
+          # `min length: 1` e rejeita o schedule-run inteiro se algum value vier vazio.
           ENV_JSON=$(jq -nc \
-            --arg email  "$TEST_USER_EMAIL" \
-            --arg pass   "$TEST_USER_PASSWORD" \
-            --arg pin    "$TEST_USER_PIN" \
-            --arg bundle "$IOS_BUNDLE_ID" \
-            '{environmentVariables:
-               [ {name:"TEST_USER_EMAIL",    value:$email},
-                 {name:"TEST_USER_PASSWORD", value:$pass},
-                 {name:"TEST_USER_PIN",      value:$pin},
-                 {name:"IOS_BUNDLE_ID",      value:$bundle}
-               ] | map(select(.value != ""))}')
+            --arg email "$TEST_USER_EMAIL" \
+            --arg pass  "$TEST_USER_PASSWORD" \
+            --arg pin   "$TEST_USER_PIN" \
+            '{environmentVariables:[
+              {name:"TEST_USER_EMAIL",value:$email},
+              {name:"TEST_USER_PASSWORD",value:$pass},
+              {name:"TEST_USER_PIN",value:$pin}
+            ]}')
 
           TEST_JSON=$(jq -nc \
             --arg tp "$TEST_ARN" --arg ts "$SPEC_ARN" \

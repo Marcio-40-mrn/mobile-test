@@ -78,7 +78,6 @@ Read from `.env` (local) or injected as environment variables by the CI / Device
 | `TEST_USER_PASSWORD` | Password of the app test account | `test/pages/login.page.ts` (`requireEnv`) |
 | `TEST_USER_PIN` | Access PIN of the app test account | `test/pages/login.page.ts` (`requireEnv`) |
 | `PLATFORM` | `android` (default) or `ios` — selects capabilities and the selector set | `test/support/platform.ts`, `wdio.conf.ts` |
-| `IOS_BUNDLE_ID` | Bundle identifier of the iOS app. **Not derivable from this repo** — `app.config.js` declares no `ios.bundleIdentifier`. Required on Device Farm; optional locally, where the session reports it | `test/support/platform.ts`, `test/pages/base.page.ts` (`resolveIosBundleId`) |
 | `REMOTE_HOST` / `REMOTE_PORT` | Appium endpoint of the manually opened Device Farm session (iOS local only). Ephemeral — refresh before each run | `test/support/platform.ts` (`requireRemoteIosSession`), `wdio.conf.ts` |
 | `REMOTE_PATH_IOS` | Path of the app inside that session; becomes the `appium:app` capability | idem |
 | `DUMP_SOURCE` | `true` replaces the suite with the page-source collection spec (set by the `dump:*` scripts) | `wdio.conf.ts` |
@@ -91,7 +90,7 @@ On AWS Device Farm the host injects `DEVICEFARM_*` variables automatically (`DEV
 
 The `.env` file is loaded via `dotenv/config` in both `wdio.conf.ts` and `scripts/download-build.ts`.
 
-CI adds AWS Device Farm secrets — see the README's "GitHub Secrets" table (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `DEVICE_FARM_PROJECT_ARN`, `DEVICE_FARM_DEVICE_POOL_ARN`, `DEVICE_FARM_IOS_DEVICE_POOL_ARN`, `IOS_BUNDLE_ID`).
+CI adds AWS Device Farm secrets — see the README's "GitHub Secrets" table (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `DEVICE_FARM_PROJECT_ARN`, `DEVICE_FARM_DEVICE_POOL_ARN`, `DEVICE_FARM_IOS_DEVICE_POOL_ARN`).
 
 ## Test Design Conventions
 

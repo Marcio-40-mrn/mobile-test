@@ -3,19 +3,21 @@ version: 0.1
 # ============================================================================
 # testspec-ios.yml — job iOS (gated por run_ios=true em mobile_test.yml)
 # ----------------------------------------------------------------------------
+# O app é identificado por CAMINHO: a fase pre_test passa
+# `appium:app = $DEVICEFARM_APP_PATH` nas --default-capabilities, igual ao
+# testspec.yml do Android. Não há bundle id envolvido — quando um é necessário
+# (remover/reinstalar em BasePage.resetApp), vem das capabilities da sessão.
+#
 # Pré-requisitos ainda EXTERNOS a este repositório:
-#   1. Build EAS iOS gerando .ipa com distribution "internal" (o passo de
-#      download do workflow já busca --platform ios). O eas.json local é um
-#      stub — os perfis de build vivem no repositório do app.
-#   2. IOS_BUNDLE_ID: o bundle identifier não é derivável daqui (app.config.js
-#      não declara ios.bundleIdentifier). Precisa vir como environment variable
-#      do schedule-run. Sem ele, wdio.conf.ts falha cedo com mensagem clara.
-#   3. DEVICE_FARM_IOS_DEVICE_POOL_ARN apontando para um pool válido.
+#   1. Uma build iOS finalizada no EAS que não seja de simulador. O passo de
+#      download do workflow aceita distribution `store` (perfil production) ou
+#      `internal`, porque o Device Farm re-assina o .ipa.
+#   2. DEVICE_FARM_IOS_DEVICE_POOL_ARN apontando para um pool válido.
 #
 # Os seletores iOS em test/pages/ foram DERIVADOS das regras de tradução em
 # test/support/locator.ts e ainda não foram validados contra um device real.
-# Para coletar a árvore de UI e corrigi-los, rode com DUMP_SOURCE=true — o spec
-# test/specs/zz-dump-source.spec.ts grava pagesource-*.xml no $DEVICEFARM_LOG_DIR.
+# Para coletar a árvore de UI e corrigi-los, use `npm run dump:ios` localmente
+# contra uma sessão aberta no Device Farm.
 # ============================================================================
 
 ios_test_host: macos_sequoia
@@ -72,7 +74,7 @@ phases:
       # Materializa as credenciais injetadas pelo schedule-run (--configuration
       # environmentVariables) num .env local — o pacote nunca carrega segredos.
       # Os valores não vão para o log: só os nomes das variáveis aparecem no comando.
-      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PIN=%s\nIOS_BUNDLE_ID=%s\n" "$TEST_USER_EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" "$IOS_BUNDLE_ID" > .env'
+      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PIN=%s\n" "$TEST_USER_EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" > .env'
       - npm run wdio
 
   post_test:

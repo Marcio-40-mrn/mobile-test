@@ -1,27 +1,18 @@
 import { L, byText, PlatformSelector } from '../support/locator';
-import { ANDROID_APP_ID, IOS_BUNDLE_ID } from '../support/platform';
+import { ANDROID_APP_ID } from '../support/platform';
 
 /**
- * Bundle identifier do app iOS em runtime.
+ * Bundle identifier do app iOS, lido da sessão.
  *
- * No CI ele vem de `IOS_BUNDLE_ID` (secret). Na sessão remota aberta manualmente
- * o app é identificado por caminho (`appium:app`), não por bundle id — mas o
- * XCUITest reporta o bundle id de volta nas capabilities da sessão. Preferir a
- * env var e cair para o valor reportado evita exigir uma quarta variável no
- * fluxo local, que já pede host, porta e caminho a cada nova sessão.
+ * Nos dois alvos iOS o app é aberto por caminho (`appium:app`) — no Device Farm
+ * via `$DEVICEFARM_APP_PATH`, localmente via `REMOTE_PATH_IOS`. O bundle id só é
+ * necessário para remover/reinstalar o app, e o XCUITest o reporta de volta nas
+ * capabilities negociadas. Não há variável de ambiente para isso.
  */
-function resolveIosBundleId(caps: Record<string, unknown>): string {
-  const reportado = (caps['appium:bundleId'] ?? caps['bundleId'] ?? caps['CFBundleIdentifier']) as
+function resolveIosBundleId(caps: Record<string, unknown>): string | undefined {
+  return (caps['appium:bundleId'] ?? caps['bundleId'] ?? caps['CFBundleIdentifier']) as
     | string
     | undefined;
-  const bundleId = IOS_BUNDLE_ID || reportado;
-  if (!bundleId) {
-    throw new Error(
-      '[base.page] Não foi possível determinar o bundle id do app iOS: IOS_BUNDLE_ID não ' +
-        'está definido e a sessão não reportou um. Defina IOS_BUNDLE_ID no .env.',
-    );
-  }
-  return bundleId;
 }
 
 export class BasePage {
@@ -148,16 +139,23 @@ export class BasePage {
    *
    * O caminho do .ipa vem da capability `appium:app` — no Device Farm ela é
    * injetada via `$DEVICEFARM_APP_PATH`, e na sessão remota local vem de
-   * `REMOTE_PATH_IOS`. Quando o app foi aberto por bundle id e não por caminho,
-   * `appPath` fica indefinido e o reset degrada para terminate + activate.
+   * `REMOTE_PATH_IOS`. O bundle id vem da sessão; se ela não reportar um, o
+   * reset degrada para relançar o app sem limpar os dados, em vez de falhar.
    */
   async resetApp(): Promise<void> {
     if (driver.isIOS) {
-      // O Device Farm injeta o .ipa via `appium:app`; o servidor pode devolver a
-      // capability negociada com ou sem o prefixo, então aceitamos as duas formas.
+      // O servidor pode devolver a capability negociada com ou sem o prefixo
+      // `appium:`, então aceitamos as duas formas.
       const caps = driver.capabilities as Record<string, unknown>;
       const appPath = (caps['appium:app'] ?? caps['app']) as string | undefined;
       const bundleId = resolveIosBundleId(caps);
+
+      if (!bundleId) {
+        console.warn('[resetApp] Sessão iOS não reportou bundle id — relançando sem limpar dados.');
+        await driver.execute('mobile: launchApp', {});
+        return;
+      }
+
       await driver.terminateApp(bundleId);
       if (appPath) {
         await driver.removeApp(bundleId);

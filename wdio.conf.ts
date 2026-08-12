@@ -6,12 +6,7 @@ import allureReporter from '@wdio/allure-reporter';
 const allureCommandline: (args: string[]) => import('child_process').ChildProcess =
   require('allure-commandline');
 import 'dotenv/config';
-import {
-  IS_IOS,
-  ANDROID_APP_ID,
-  requireIosBundleId,
-  requireRemoteIosSession,
-} from './test/support/platform';
+import { IS_IOS, ANDROID_APP_ID, requireRemoteIosSession } from './test/support/platform';
 import { BUILD_DEST } from './scripts/download-build';
 
 // ─── Detecção de ambiente ────────────────────────────────────────────────────
@@ -81,15 +76,16 @@ const iosBaseCapability = {
   'appium:wdaConnectionTimeout': 240000,
 };
 
-// Sessão remota: o app já está no device da sessão, identificado pelo caminho.
-// `bundleId` não é exigido aqui — o XCUITest o reporta de volta na sessão, e
-// BasePage.resetApp() usa esse valor quando IOS_BUNDLE_ID não está definido.
+// Nos dois alvos iOS o app é identificado por CAMINHO, nunca por bundle id:
+// no Device Farm o testspec já passa `appium:app = $DEVICEFARM_APP_PATH` nas
+// --default-capabilities, então aqui não declaramos app nenhum; na sessão remota
+// o caminho vem de REMOTE_PATH_IOS.
 const remoteIosSession = IS_IOS && !isDeviceFarm ? requireRemoteIosSession() : null;
 
 const capability = IS_IOS
   ? remoteIosSession
     ? { ...iosBaseCapability, 'appium:app': remoteIosSession.app }
-    : { ...iosBaseCapability, 'appium:bundleId': requireIosBundleId() }
+    : iosBaseCapability
   : isDeviceFarm
     ? androidCapability
     : localCapability;

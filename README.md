@@ -11,7 +11,7 @@
 | Android local (com install) | `npm test` | Emulador `S25Ultra_API35` + `EXPO_TOKEN` |
 | iOS local | `npm run test:ios` | Sessão aberta no Device Farm + `REMOTE_*` no `.env` (ver abaixo) |
 | Device Farm — Android (CI) | GitHub Actions, todo `pull_request` | Secrets AWS + EXPO configurados |
-| Device Farm — iOS (gated) | `workflow_dispatch` com `run_ios=true` | Build `.ipa` internal no EAS + `IOS_BUNDLE_ID` |
+| Device Farm — iOS (gated) | `workflow_dispatch` com `run_ios=true` | Build iOS finalizada no EAS (não-simulador) |
 | Coleta de page source | `npm run dump:ios` / `npm run dump:android` | Idem ao alvo local correspondente |
 
 ### iOS local — sessão remota no Device Farm
@@ -59,9 +59,6 @@ EXPO_PROJECT_ID=<id do projeto no EAS — lido por app.config.js>
 REMOTE_HOST=<host do Appium da sessão>
 REMOTE_PORT=<porta do Appium da sessão>
 REMOTE_PATH_IOS=<caminho do app na sessão — vira a capability appium:app>
-
-# iOS — bundle identifier do app (opcional no fluxo local; obrigatório no CI)
-IOS_BUNDLE_ID=<ex.: com.aramis.arys>
 ```
 
 > O `app.config.js` lê `EXPO_PROJECT_ID` do `.env` e o expõe como
@@ -70,9 +67,10 @@ IOS_BUNDLE_ID=<ex.: com.aramis.arys>
 > pertencer ao projeto de slug `arys` — um id de outro projeto faz o `eas build:list`
 > recusar com erro de slug, e o download local do APK falha.
 
-`IOS_BUNDLE_ID` é opcional na execução local: quando ausente, o bundle id é lido das
-capabilities que a sessão XCUITest reporta. No CI ele é obrigatório, porque lá o app é
-identificado por bundle id e não por caminho.
+Não há variável de bundle identifier: nos dois alvos iOS o app é identificado por
+**caminho** — `$DEVICEFARM_APP_PATH` no Device Farm, `REMOTE_PATH_IOS` na sessão local.
+Quando um bundle id é necessário (remover/reinstalar o app), ele vem das capabilities
+que a própria sessão XCUITest reporta.
 
 Variáveis opcionais: `SKIP_DOWNLOAD=true` pula o download/install do APK;
 `PLATFORM=ios` seleciona o alvo iOS; `DUMP_SOURCE=true` troca a suíte pelo spec de coleta
@@ -149,10 +147,13 @@ Workflow `.github/workflows/mobile_test.yml` — arquivo único, parametrizado p
 `strategy.matrix.platform`. Roda no AWS Device Farm (região `us-west-2`):
 
 1. O job `setup` resolve a matrix aplicando o gate do iOS
-2. Baixa o build mais recente do EAS (`app.apk` / `app.ipa`)
+2. Baixa o build mais recente do EAS (`app.apk` / `app.ipa`). O filtro difere por
+   plataforma: no Android exige `distribution: internal`; no iOS aceita qualquer build
+   finalizada que **não** seja de simulador — as builds iOS do projeto saem do perfil
+   `production`, cuja distribution é `store`, e o Device Farm re-assina o `.ipa`
 3. Empacota os testes num zip (sem `node_modules` — o Device Farm roda `npm install`)
 4. Sobe app, pacote e testspec ao Device Farm (create → transfer → wait)
-5. `schedule-run` injetando credenciais e `IOS_BUNDLE_ID` como `environmentVariables`; o
+5. `schedule-run` injetando as credenciais como `environmentVariables`; o
    testspec grava um `.env` e o `wdio.conf.ts` detecta o ambiente via `DEVICEFARM_DEVICE_UDID`
 6. Faz polling do run e coleta os `allure-results`; o job `publish-report` consolida os
    relatórios das duas plataformas
@@ -162,9 +163,6 @@ com `run_ios=true`, por isso não bloqueia PRs. O que já existe no código: cap
 XCUITest no `wdio.conf.ts`, camada de seletores por plataforma e `testspec-ios.yml` alinhado
 ao padrão do Android. O que ainda falta para o job passar:
 
-- build EAS iOS gerando `.ipa` com distribution `internal` (o `eas.json` local é um stub;
-  os perfis vivem no repositório do app)
-- o secret `IOS_BUNDLE_ID`
 - **validar os seletores iOS num device** — eles foram derivados das regras de tradução em
   `test/support/locator.ts` e nunca rodaram de verdade. Use `npm run dump:ios` contra uma
   sessão remota para coletar a árvore de UI e corrigi-los. Ver também o cabeçalho de
@@ -184,7 +182,6 @@ ao padrão do Android. O que ainda falta para o job passar:
 | `TEST_USER_PIN` | PIN de acesso do app |
 | `EXPO_TOKEN` | Token EAS para download de builds |
 | `EXPO_PROJECT_ID` | ID do projeto no EAS — lido por `app.config.js` |
-| `IOS_BUNDLE_ID` | Bundle identifier do app iOS. Não é derivável deste repositório: o `app.config.js` não declara `ios.bundleIdentifier` |
 
 ## Arquitetura
 
