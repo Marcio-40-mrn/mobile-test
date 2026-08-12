@@ -1,0 +1,5 @@
+"DESCRIPTION","DURATION IN MS","NAME","PARENT SUITE","START TIME","STATUS","STOP TIME","SUB SUITE","SUITE","TEST CLASS","TEST METHOD"
+"","43889","""before all"" hook for Clientes","","2026-08-12","broken","2026-08-12","","","",""
+"","3475","deve verificar e aplicar atualização disponível","Update Check","2026-08-12","broken","2026-08-12","","","",""
+"","3460","deve verificar e aplicar atualização disponível","Update Check","2026-08-12","broken","2026-08-12","","","",""
+"","3734","deve verificar e aplicar atualização disponível","Update Check","2026-08-12","broken","2026-08-12","","","",""
