@@ -1,54 +1,112 @@
 version: 0.1
 
 # ============================================================================
-# testspec-ios.yml — job iOS (gated por run_ios=true em mobile_test.yml)
+# testspec-ios.yml — iOS no AWS Device Farm
 # ----------------------------------------------------------------------------
-# O app é identificado por CAMINHO: a fase pre_test passa
-# `appium:app = $DEVICEFARM_APP_PATH` nas --default-capabilities, igual ao
-# testspec.yml do Android. Não há bundle id envolvido — quando um é necessário
-# (remover/reinstalar em BasePage.resetApp), vem das capabilities da sessão.
+# O job iOS (mobile_test.yml) roda em todo PR e dispatch, um run por iPhone do
+# pool, sem gate. Os 5 steps de "Ordenar por"/"busca sem resultado" de
+# clientes.spec.ts falham por um bug de acessibilidade do app (bottom sheets e o
+# card de aba vazia não expõem filhos à árvore XCUITest) — a correção é no app
+# (`accessible={false}` no container do @gorhom/bottom-sheet + testID por opção).
+# Esse vermelho aparece no relatório e NÃO quebra a esteira.
 #
-# Pré-requisitos ainda EXTERNOS a este repositório:
-#   1. Uma build iOS finalizada no EAS que não seja de simulador. O passo de
-#      download do workflow aceita distribution `store` (perfil production) ou
-#      `internal`, porque o Device Farm re-assina o .ipa.
-#   2. DEVICE_FARM_IOS_DEVICE_POOL_ARN apontando para um pool válido.
+# HOST — `ios_test_host` é obrigatório. Sem ele o Device Farm cai no host LEGADO
+# (macOS Ventura/Sonoma por versão de iOS, Appium 2.2.1/2.11.5, `nvm`), e nos
+# iPhones com iOS 26 nem existe legado. Medido no run #28 (2026-09-17): cada
+# iPhone caiu num host diferente, `appium driver install xcuitest` falhou em
+# todos e a sessão morria com "Could not find a driver for automationName
+# 'XCUITest'". `macos_tahoe` cobre iOS 17–27 (todo o pool) com o MESMO software.
+# Referência: docs.aws.amazon.com/devicefarm/latest/developerguide/
+#   custom-test-environments-hosts.html, ios-host-migration.html,
+#   custom-test-environments-hosts-software.html, test-types-appium.html
 #
-# Os seletores iOS em test/pages/ foram DERIVADOS das regras de tradução em
-# test/support/locator.ts e ainda não foram validados contra um device real.
-# Para coletar a árvore de UI e corrigi-los, use `npm run dump:ios` localmente
-# contra uma sessão aberta no Device Farm.
+# SOFTWARE — nos hosts novos `nvm`/`avm` não existem; Node e Appium vêm do
+# `devicefarm-cli`, e o Appium 3 selecionado por ele JÁ traz o driver XCUITest
+# compatível (não instalar driver na mão). Isso só vale porque `appium` NÃO é
+# dependência do package.json (regra 12): se fosse, o Appium trataria o pacote de
+# teste como APPIUM_HOME e ignoraria os drivers do host — foi o run #29 (5/5 sem
+# driver, "Could not find a driver for automationName 'XCUITest'"), o mesmo
+# run-22 da referência MobileWDIO. O WDA pré-assinado é escolhido pela
+# versão major do driver via DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH_V<N>
+# (os nomes antigos DEVICEFARM_WDA_DERIVED_DATA_PATH* são do host legado).
+#
+# `export PLATFORM=ios` na fase test é o que seleciona a suíte iOS.
+#
+# CREDENCIAIS — o host iOS NÃO recebe as `environmentVariables` do schedule-run
+# (medido no projeto de referência MobileWDIO, "CI iOS Run #6": o script que a AWS
+# gera monta o próprio ambiente e só exporta DEVICEFARM_*). O único canal com
+# valor por run é este arquivo: o step "Agenda os runs (iOS)" de mobile_test.yml
+# substitui a linha `__CREDENCIAIS_DO_RUN__` (fase test, abaixo) por um
+# `export TEST_USER_EMAIL=… TEST_USER_PASSWORD=… TEST_USER_PIN=… DEVICE_LABEL=…`
+# e sobe UMA cópia deste testspec por iPhone do pool. Este arquivo, como está no
+# repositório, não roda: a guarda abaixo falha se o marcador não foi substituído.
+# Custo aceito: as credenciais aparecem nos artefatos "Test spec file"/"Test spec
+# output" do Device Farm (visíveis só para a conta AWS) — igual à referência.
 # ============================================================================
 
-ios_test_host: macos_sequoia
+ios_test_host: macos_tahoe
 
 phases:
   install:
     commands:
-      # Mesma estratégia do testspec.yml (Android): o driver é instalado no
-      # APPIUM_HOME do host, não como dependência npm do pacote de testes.
-      # Se este host não expuser `devicefarm-cli`, o fallback é instalar o Node 18
-      # via nvm em cada fase (o nvm não persiste entre elas) e usar o Appium do host.
+      # Mesmo Node do testspec.yml (Android). O Appium 3 exige Node >= 20.
       - devicefarm-cli use node 22
       - node --version
+      # Appium 3 do host, com o driver XCUITest pré-instalado e compatível.
       - devicefarm-cli use appium 3
       - appium --version
-      - appium driver install xcuitest
+      - appium driver list --installed
       - export APPIUM_BASE_PATH=
       - cd $DEVICEFARM_TEST_PACKAGE_PATH
-      - npm install --prefer-offline
+      # O host às vezes derruba a conexão baixando pacotes (ECONNRESET). Sem
+      # dependências o `npm run wdio` dá "wdio: command not found", o teste nem
+      # roda e o device some do relatório sem erro óbvio. Três tentativas.
+      - |-
+        for i in 1 2 3; do
+          npm install --prefer-offline && break
+          echo "npm install falhou (tentativa $i/3)"; sleep 10
+          [ "$i" = 3 ] && { echo "npm install esgotou as 3 tentativas"; exit 1; }
+        done
 
   pre_test:
     commands:
+      # WDA pré-assinado correspondente à versão major do driver XCUITest instalado
+      # (bloco da documentação da AWS). Exportado porque o wdio.conf.ts também o
+      # lê para montar `appium:derivedDataPath`.
+      - |-
+        APPIUM_DRIVER_VERSION=$(appium driver list --installed --json | jq -r ".xcuitest.version" | cut -d "." -f 1);
+        CORRESPONDING_APPIUM_WDA=$(env | grep "DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH_V${APPIUM_DRIVER_VERSION}")
+        if [[ ! -z "$APPIUM_DRIVER_VERSION" ]] && [[ ! -z "$CORRESPONDING_APPIUM_WDA" ]]; then
+          echo "Using a prebuilt version of the WDA app corresponding with your XCUITest driver version ${APPIUM_DRIVER_VERSION}";
+          DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH=$(echo $CORRESPONDING_APPIUM_WDA | cut -d "=" -f2)
+        else
+          LATEST_SUPPORTED_WDA_VERSION=$(env | grep "DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH_V" | sort -V -r | head -n 1)
+          echo "Unknown driver version $APPIUM_DRIVER_VERSION; falling back to the Device Farm default version of $LATEST_SUPPORTED_WDA_VERSION";
+          DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH=$(echo $LATEST_SUPPORTED_WDA_VERSION | cut -d "=" -f2)
+        fi;
+        export DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH
+        echo "[diag] WDA derivedDataPath: ${DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH:-<vazio>}"
+
+      # iOS <= 16 exige o UDID sem hífens (bloco da documentação da AWS). O pool
+      # hoje é iOS 17+, mas a regra fica para não quebrar se um aparelho entrar.
+      - |-
+        if [ $(echo $DEVICEFARM_DEVICE_OS_VERSION | cut -d "." -f 1) -le 16 ];
+        then
+          DEVICEFARM_DEVICE_UDID_FOR_APPIUM=$(echo $DEVICEFARM_DEVICE_UDID | tr -d "-");
+        else
+          DEVICEFARM_DEVICE_UDID_FOR_APPIUM=$DEVICEFARM_DEVICE_UDID;
+        fi;
+
       - |-
         appium --base-path=$APPIUM_BASE_PATH --log-timestamp \
           --log-no-colors --relaxed-security --default-capabilities \
           "{\"appium:deviceName\": \"$DEVICEFARM_DEVICE_NAME\", \
           \"platformName\": \"$DEVICEFARM_DEVICE_PLATFORM_NAME\", \
           \"appium:app\": \"$DEVICEFARM_APP_PATH\", \
-          \"appium:udid\":\"$DEVICEFARM_DEVICE_UDID\", \
+          \"appium:udid\":\"$DEVICEFARM_DEVICE_UDID_FOR_APPIUM\", \
           \"appium:platformVersion\": \"$DEVICEFARM_DEVICE_OS_VERSION\", \
-          \"appium:derivedDataPath\": \"$DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH_V9\", \
+          \"appium:derivedDataPath\": \"$DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH\", \
+          \"appium:usePrebuiltWDA\": true, \
           \"appium:automationName\": \"XCUITest\"}" \
           >> $DEVICEFARM_LOG_DIR/appium.log 2>&1 &
 
@@ -66,15 +124,26 @@ phases:
 
   test:
     commands:
-      - ls $DEVICEFARM_TEST_PACKAGE_PATH
       - cd $DEVICEFARM_TEST_PACKAGE_PATH
-      # Sinaliza a plataforma para wdio.conf.ts (capabilities XCUITest) e para a
-      # camada de seletores em test/support/platform.ts.
       - export PLATFORM=ios
-      # Materializa as credenciais injetadas pelo schedule-run (--configuration
-      # environmentVariables) num .env local — o pacote nunca carrega segredos.
-      # Os valores não vão para o log: só os nomes das variáveis aparecem no comando.
-      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PIN=%s\n" "$TEST_USER_EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" > .env'
+      # Substituída pelo CI por um bloco `- |-` com `export TEST_USER_EMAIL=…
+      # TEST_USER_PASSWORD=… TEST_USER_PIN=… DEVICE_LABEL=…` (ver cabeçalho). Fica
+      # NESTA fase porque o .env é escrito logo abaixo.
+      - __CREDENCIAIS_DO_RUN__
+      # Guarda: credencial ausente falha AQUI, com nome, e não três telas depois
+      # dentro do login. Os valores nunca vão para o log — só os comprimentos.
+      - |-
+        if [ -z "${TEST_USER_EMAIL:-}" ] || [ -z "${TEST_USER_PASSWORD:-}" ] || [ -z "${TEST_USER_PIN:-}" ]; then
+          echo "Credenciais ausentes no host iOS: o marcador __CREDENCIAIS_DO_RUN__ deste testspec não foi substituído pelo step 'Agenda os runs (iOS)' de mobile_test.yml"
+          exit 1
+        fi
+      - 'echo "[diag] TEST_USER_EMAIL len=${#TEST_USER_EMAIL} TEST_USER_PASSWORD len=${#TEST_USER_PASSWORD} TEST_USER_PIN len=${#TEST_USER_PIN} DEVICE_LABEL=${DEVICE_LABEL:-}"'
+      # DEVICE_LABEL é o nome do aparelho que o CI leu do pool — no iOS o
+      # DEVICEFARM_DEVICE_NAME é o UDID, inútil como rótulo no Allure.
+      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PIN=%s\nDEVICE_LABEL=%s\n" "$TEST_USER_EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" "${DEVICE_LABEL:-}" > .env'
+      # Versão/build/profile do app (do EAS, na mesma linha export) → environment.properties do Allure.
+      - 'printf "APP_VERSION=%s\nAPP_BUILD_VERSION=%s\nAPP_BUILD_PROFILE=%s\n" "${APP_VERSION:-}" "${APP_BUILD_VERSION:-}" "${APP_BUILD_PROFILE:-}" >> .env'
+      - 'echo "[diag] app ${APP_VERSION:-?} (${APP_BUILD_VERSION:-?}) profile ${APP_BUILD_PROFILE:-?}"'
       - npm run wdio
 
   post_test:

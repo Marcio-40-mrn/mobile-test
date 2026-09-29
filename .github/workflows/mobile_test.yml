@@ -1,23 +1,21 @@
 name: Mobile E2E — AWS Device Farm
 
 # Roda os testes E2E no AWS Device Farm — TUDO num arquivo só (job device-farm com matrix).
-# - Android: roda em todo pull_request e no dispatch manual.
-# - iOS: GATED — só roda via dispatch manual com run_ios=true. A suíte já é
-#   cross-platform (capabilities XCUITest no wdio.conf.ts + camada de seletores em
-#   test/support/locator.ts), mas os seletores iOS foram derivados das regras de
-#   tradução e ainda não foram validados contra um device real. Por isso não roda
-#   em PRs. Para inspecionar a árvore de elementos, use `npm run dump:ios`
-#   localmente contra uma sessão aberta no Device Farm.
-# O job `setup` monta a matrix dinamicamente para aplicar esse gate.
+# Android e iOS rodam SEMPRE, em todo pull_request e no dispatch manual — sem input, sem
+# gate, sem matrix condicional. Os 5 steps de clientes que falham no iOS por bug de
+# acessibilidade do app (bottom sheet sem filhos na árvore XCUITest — ver testspec-ios.yml)
+# aparecem vermelhos no relatório; o Device Farm não quebra a esteira (ver "Aguarda…").
+#
+# Android e iOS compartilham os steps de build, pacote e coleta; divergem só em como
+# o run é agendado e como as credenciais chegam ao host (ver os steps "Agenda…"):
+#   Android — 1 run para o pool, credenciais por environmentVariables
+#   iOS     — 1 run por iPhone, credenciais injetadas no testspec (o host iOS não
+#             recebe environmentVariables)
+# Desenho herdado do projeto MobileWDIO (.planning/codebase/LICOES-CI-MOBILEWDIO.md).
 
 on:
   pull_request:
   workflow_dispatch:
-    inputs:
-      run_ios:
-        description: "Rodar também o job iOS (experimental — ainda não pronto)"
-        type: boolean
-        default: false
 
 # Cancela runs antigos da mesma ref quando um novo começa.
 concurrency:
@@ -25,31 +23,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Decide quais plataformas rodam nesta execução (gate do iOS).
-  setup:
-    name: Resolve plataformas
-    runs-on: ubuntu-latest
-    outputs:
-      platforms: ${{ steps.m.outputs.platforms }}
-    steps:
-      - id: m
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_ios }}" = "true" ]; then
-            echo 'platforms=["android","ios"]' >> "$GITHUB_OUTPUT"
-          else
-            echo 'platforms=["android"]' >> "$GITHUB_OUTPUT"
-          fi
-
   device-farm:
     name: "${{ matrix.platform }} — Device Farm"
-    needs: setup
     runs-on: ubuntu-latest
+    # Uploads + até 120 min de poll no Device Farm + coleta. Rede de segurança
+    # contra um step pendurado; o poll já tem o próprio limite.
+    timeout-minutes: 150
     strategy:
       # Uma plataforma não cancela a outra ao falhar.
       fail-fast: false
       matrix:
-        platform: ${{ fromJSON(needs.setup.outputs.platforms) }}
+        platform: [android, ios]
     env:
       AWS_DEFAULT_REGION: us-west-2
     steps:
@@ -61,6 +45,18 @@ jobs:
 
       - name: Instala EAS CLI e Allure
         run: npm install -g eas-cli allure-commandline
+
+      # Reproduz no runner o mesmo `npm install` do testspec e carrega o webdriverio como o
+      # `wdio run` faz. Um package-lock.json inconsistente (caso do merge 2050647, que deixou
+      # o archiver-utils sem dependente e o npm o podou) quebra aqui em ~1 min, em vez de
+      # ocupar 5 devices no Device Farm e terminar sem nenhum *-result.json.
+      # `npm ci` não serve: o appium-uiautomator2-driver traz um npm-shrinkwrap gerado em
+      # Linux e o npm acusa "Missing @img/sharp-*" para as outras plataformas.
+      - name: Pré-verifica dependências (mesmo npm install do testspec)
+        run: |
+          set -euo pipefail
+          npm install --prefer-offline
+          node --input-type=module -e "await import('webdriverio')"
 
       - name: Resolve parâmetros da plataforma
         id: vars
@@ -76,40 +72,113 @@ jobs:
             echo "testspec=testspec-ios.yml"  >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Baixa o build mais recente do EAS
+      # Qual build baixar vem de SECRETS do repositório (Settings > Secrets and variables >
+      # Actions > Secrets — não da aba Variables; `vars.` não enxerga um secret):
+      #   BUILD_PROFILE_ANDROID / BUILD_PROFILE_IOS — profile do EAS por plataforma
+      #     (Android e iOS costumam ser buildados em profiles diferentes). Vazio =>
+      #     mantém o comportamento antigo, filtrando por distribution=internal.
+      #   BUILD_SELECTION — latest (default) | date
+      #   BUILD_FROM / BUILD_TO — YYYY-MM-DD, inclusivos, só em BUILD_SELECTION=date
+      - name: Baixa o build do EAS
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+          BUILD_PROFILE_ANDROID: ${{ secrets.BUILD_PROFILE_ANDROID }}
+          BUILD_PROFILE_IOS: ${{ secrets.BUILD_PROFILE_IOS }}
+          BUILD_SELECTION: ${{ secrets.BUILD_SELECTION }}
+          BUILD_FROM: ${{ secrets.BUILD_FROM }}
+          BUILD_TO: ${{ secrets.BUILD_TO }}
         run: |
           set -euo pipefail
-          if [ "${{ matrix.platform }}" = "ios" ]; then
-            # As builds iOS do projeto saem do perfil `production`, cuja distribution
-            # é `store` — filtrar por `internal` (como no Android) as excluía e o job
-            # não achava build nenhuma. Aqui só descartamos builds de SIMULADOR, que
-            # geram .app/.tar.gz e não instalam em device real; store e internal
-            # servem, porque o Device Farm re-assina o .ipa.
-            echo "Buscando build iOS finalizada (qualquer distribution exceto simulator)..."
-            BUILD_JSON=$(eas build:list --platform ios --limit 10 \
-              --status finished --json --non-interactive)
-            echo "$BUILD_JSON" | jq -r '.[] | "  - \(.id) distribution=\(.distribution // "?") artifacts=\(if .artifacts.buildUrl then "sim" else "não" end)"'
-            URL=$(echo "$BUILD_JSON" | jq -r '
-              [ .[] | select((.distribution // "" | ascii_downcase) != "simulator")
-                    | select(.artifacts.buildUrl) ][0].artifacts.buildUrl // empty')
+
+          # Cada plataforma lê o seu profile; um job nunca usa o do outro. iOS sem
+          # variável cai em 'production': no EAS toda build iOS é distribution=store,
+          # então o fallback por distribution=internal (que serve ao Android) nunca acha nada.
+          if [ "${{ matrix.platform }}" = "android" ]; then
+            BUILD_PROFILE="${BUILD_PROFILE_ANDROID:-}"
           else
-            echo "Buscando build Android INTERNAL finalizada..."
-            BUILD_JSON=$(eas build:list --platform android --limit 1 \
-              --status finished --distribution internal --json --non-interactive)
-            URL=$(echo "$BUILD_JSON" | jq -r '.[0].artifacts.buildUrl // empty')
+            BUILD_PROFILE="${BUILD_PROFILE_IOS:-production}"
           fi
-          if [ -z "$URL" ]; then
-            if [ "${{ matrix.platform }}" = "ios" ]; then
-              echo "::error::Nenhuma build iOS instalável encontrada no EAS (a listagem acima mostra o que existe). É preciso uma build finalizada, com artifact, que não seja de simulador."
-            else
-              echo "::error::Nenhuma build Android INTERNAL finalizada encontrada no EAS."
-            fi
+
+          MODE="${BUILD_SELECTION:-latest}"
+          if [ "$MODE" != "latest" ] && [ "$MODE" != "date" ]; then
+            echo "::error::BUILD_SELECTION inválido: '$MODE'. Use 'latest' ou 'date'."
             exit 1
           fi
-          curl -sSL --retry 3 -o "${{ steps.vars.outputs.app_file }}" "$URL"
+
+          FROM_ISO=""
+          TO_ISO=""
+          if [ "$MODE" = "date" ]; then
+            if [ -z "${BUILD_FROM:-}" ] && [ -z "${BUILD_TO:-}" ]; then
+              echo "::error::BUILD_SELECTION='date' exige BUILD_FROM e/ou BUILD_TO."
+              exit 1
+            fi
+            # createdAt do EAS é ISO-8601 UTC, então as bordas viram ISO para
+            # permitir comparação lexicográfica direta no jq.
+            if [ -n "${BUILD_FROM:-}" ]; then
+              FROM_ISO=$(date -u -d "$BUILD_FROM 00:00:00" +%Y-%m-%dT%H:%M:%S.000Z)
+            fi
+            if [ -n "${BUILD_TO:-}" ]; then
+              TO_ISO=$(date -u -d "$BUILD_TO 23:59:59" +%Y-%m-%dT%H:%M:%S.999Z)
+            fi
+            RANGE_LABEL="${BUILD_FROM:-início} .. ${BUILD_TO:-hoje}"
+            LIMIT=100   # mode=date precisa varrer histórico
+          else
+            RANGE_LABEL="mais recente"
+            LIMIT=20
+          fi
+
+          # Android sem profile configurado mantém o filtro histórico por distribuição.
+          if [ -n "$BUILD_PROFILE" ]; then
+            FILTER_ARGS=(--build-profile "$BUILD_PROFILE")
+            PROFILE_LABEL="$BUILD_PROFILE"
+          else
+            FILTER_ARGS=(--distribution internal)
+            PROFILE_LABEL="internal"
+          fi
+
+          echo "Buscando build ${{ matrix.platform }} '$PROFILE_LABEL' ($RANGE_LABEL)..."
+          BUILD_JSON=$(eas build:list --platform "${{ matrix.platform }}" \
+            "${FILTER_ARGS[@]}" --limit "$LIMIT" \
+            --status finished --json --non-interactive)
+
+          # O mesmo registro que dá a URL traz versão, número do build e profile — vão
+          # para o Allure (environment.properties, via APP_* no host) e para o summary.
+          SELECTED=$(echo "$BUILD_JSON" | jq -c \
+            --arg profile "$BUILD_PROFILE" --arg from "$FROM_ISO" --arg to "$TO_ISO" '
+            map(select(.status == "FINISHED" and .artifacts.buildUrl != null))
+            | map(select($profile == "" or .buildProfile == $profile))
+            | map(select($from    == "" or .createdAt >= $from))
+            | map(select($to      == "" or .createdAt <= $to))
+            | sort_by(.createdAt) | reverse
+            | .[0] // empty')
+
+          if [ -z "$SELECTED" ]; then
+            echo "::error::Nenhuma build ${{ matrix.platform }} '$PROFILE_LABEL' finalizada encontrada no EAS ($RANGE_LABEL)."
+            exit 1
+          fi
+          URL=$(echo "$SELECTED" | jq -r '.artifacts.buildUrl')
+          APP_VERSION=$(echo "$SELECTED" | jq -r '.appVersion // empty')
+          APP_BUILD_VERSION=$(echo "$SELECTED" | jq -r '.appBuildVersion // empty')
+          APP_BUILD_PROFILE=$(echo "$SELECTED" | jq -r '.buildProfile // empty')
+          {
+            echo "APP_VERSION=$APP_VERSION"
+            echo "APP_BUILD_VERSION=$APP_BUILD_VERSION"
+            echo "APP_BUILD_PROFILE=$APP_BUILD_PROFILE"
+          } >> "$GITHUB_ENV"
+          echo "Build ${{ matrix.platform }}: versão ${APP_VERSION:-?} (${APP_BUILD_VERSION:-?}), profile ${APP_BUILD_PROFILE:-?}, criado em $(echo "$SELECTED" | jq -r '.createdAt')"
+          echo "**Build ${{ matrix.platform }}:** \`${APP_VERSION:-?}\` (${APP_BUILD_VERSION:-?}) — profile \`${APP_BUILD_PROFILE:-?}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # Profile `production` do Android entrega .aab; o Device Farm só instala .apk
+          # (upload ANDROID_APP), então o bundle vira APK universal com o mesmo
+          # scripts/convert-aab.ts da execução local (o runner já traz JDK).
+          if [ "${{ matrix.platform }}" = "android" ] && [[ "${URL%%\?*}" == *.aab ]]; then
+            curl -sSL --retry 3 -o app.aab "$URL"
+            npx ts-node scripts/convert-aab.ts --input app.aab --output "${{ steps.vars.outputs.app_file }}"
+            rm -f app.aab
+          else
+            curl -sSL --retry 3 -o "${{ steps.vars.outputs.app_file }}" "$URL"
+          fi
           ls -lh "${{ steps.vars.outputs.app_file }}"
 
       - name: Empacota os testes (sem node_modules — o Device Farm roda npm install)
@@ -123,9 +192,17 @@ jobs:
             -x "docs/*" \
             -x "reports/*" \
             -x "test/screenshots/*" \
+            -x "test/videos/*" \
             -x "artifacts/*" \
-            -x "app.apk" -x "app.ipa" \
+            -x ".env" \
+            -x "app.apk" -x "app.aab" -x "app.ipa" \
             -x "test-package.zip"
+          # Credenciais nunca viajam no pacote: no Android chegam por environmentVariables,
+          # no iOS pelo testspec gerado por run. Um .env aqui seria vazamento.
+          if unzip -l test-package.zip | grep -qE ' [.]env$'; then
+            echo "::error::Há um .env dentro do test-package.zip — credenciais não viajam no pacote"
+            exit 1
+          fi
           ls -lh test-package.zip
 
       - name: Configura credenciais AWS
@@ -135,130 +212,374 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-west-2
 
-      - name: Sobe artefatos e agenda o run no Device Farm
-        id: schedule
+      - name: Sobe app e pacote de testes no Device Farm
+        id: uploads
         env:
           PROJECT_ARN: ${{ secrets.DEVICE_FARM_PROJECT_ARN }}
           RUN_NUMBER: ${{ github.run_number }}
           APP_FILE: ${{ steps.vars.outputs.app_file }}
           APP_TYPE: ${{ steps.vars.outputs.app_type }}
-          TESTSPEC: ${{ steps.vars.outputs.testspec }}
-          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
-          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
-          TEST_USER_PIN: ${{ secrets.TEST_USER_PIN }}
         run: |
           set -euo pipefail
+          source .github/scripts/devicefarm-upload.sh
+          APP_ARN=$(df_upload "app-${RUN_NUMBER}.${APP_FILE##*.}" "$APP_TYPE" "$APP_FILE")
+          PKG_ARN=$(df_upload "tests-${RUN_NUMBER}.zip" APPIUM_NODE_TEST_PACKAGE test-package.zip)
+          echo "app_arn=$APP_ARN" >> "$GITHUB_OUTPUT"
+          echo "pkg_arn=$PKG_ARN" >> "$GITHUB_OUTPUT"
 
-          # Escolhe o device pool conforme a plataforma (secret fica no step, mascarado).
+      # Lê o pool da plataforma e decide a conta de cada aparelho — a cada run, sem
+      # nenhum modelo de aparelho no repositório. Só um pool PRIVATE com regra
+      # "ARN IN" tem uma lista fixa para percorrer (um filtro genérico como "qualquer
+      # iPhone com iOS 17" não tem). Ordenação byte a byte (LC_ALL=C) para a
+      # distribuição de contas ser a mesma em qualquer locale do runner.
+      #
+      # Contas: sem o secret CSV da plataforma (TEST_USER_ANDROID_EMAILS /
+      # TEST_USER_IOS_EMAILS) todos os aparelhos usam TEST_USER_EMAIL, como sempre.
+      # Com o CSV, o i-ésimo device (ordem alfabética do nome) recebe o i-ésimo e-mail;
+      # mais devices do que e-mails é erro — dois aparelhos na mesma conta disputariam o
+      # mesmo estado no backend. Mudar o pool só redistribui.
+      - name: Resolve devices e contas do pool
+        id: pool
+        env:
+          ANDROID_POOL_ARN: ${{ secrets.DEVICE_FARM_DEVICE_POOL_ARN }}
+          IOS_POOL_ARN: ${{ secrets.DEVICE_FARM_IOS_DEVICE_POOL_ARN }}
+          ANDROID_EMAILS_CSV: ${{ secrets.TEST_USER_ANDROID_EMAILS }}
+          IOS_EMAILS_CSV: ${{ secrets.TEST_USER_IOS_EMAILS }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+        run: |
+          set -euo pipefail
           if [ "${{ matrix.platform }}" = "android" ]; then
-            POOL_ARN="${{ secrets.DEVICE_FARM_DEVICE_POOL_ARN }}"
+            POOL_ARN="$ANDROID_POOL_ARN"; EMAILS_CSV="${ANDROID_EMAILS_CSV:-}"
           else
-            POOL_ARN="${{ secrets.DEVICE_FARM_IOS_DEVICE_POOL_ARN }}"
+            POOL_ARN="$IOS_POOL_ARN"; EMAILS_CSV="${IOS_EMAILS_CSV:-}"
           fi
 
-          # create → transfer (curl PUT no S3 pré-assinado) → wait até SUCCEEDED.
-          # IMPORTANTE: todo log da função vai para stderr (>&2). Só o arn final sai no
-          # stdout — senão o $(upload ...) captura as linhas de progresso junto e o
-          # schedule-run recebe um "arn" inválido (ValidationException: Invalid arn ...).
-          upload() {
-            local name="$1" type="$2" file="$3"
-            local resp arn url status i
-            resp=$(aws devicefarm create-upload --project-arn "$PROJECT_ARN" \
-              --name "$name" --type "$type" --query 'upload.{arn:arn,url:url}' --output json)
-            arn=$(echo "$resp" | jq -r .arn)
-            url=$(echo "$resp" | jq -r .url)
-            curl -sS -T "$file" "$url"
-            for i in $(seq 1 20); do
-              status=$(aws devicefarm get-upload --arn "$arn" --query 'upload.status' --output text)
-              echo "$name: $status ($i/20)" >&2
-              [ "$status" = "SUCCEEDED" ] && { echo "$arn"; return 0; }
-              [ "$status" = "FAILED" ] && { echo "::error::Upload $name falhou" >&2; return 1; }
-              sleep 10
+          RULE=$(aws devicefarm get-device-pool --arn "$POOL_ARN" \
+            --query "devicePool.rules[?attribute=='ARN' && operator=='IN'].value | [0]" --output text)
+          if [ -z "$RULE" ] || [ "$RULE" = "None" ]; then
+            echo "::error::O pool ${{ matrix.platform }} não tem regra ARN IN — ajuste-o para uma lista fixa de devices"
+            exit 1
+          fi
+
+          # nome<TAB>arn<TAB>modelId. O sed tira o espaço final que a API devolve em alguns
+          # nomes; modelId é o valor que o UiAutomator2 expõe em capabilities.deviceModel.
+          # Alguns devices têm modelId composto ("{SM-A515F,SM-A515U1}"): vira A|B para a
+          # vírgula não quebrar o CSV — test/utils/credentials.ts aceita qualquer alternativa.
+          : > devices-raw.tsv
+          for ARN in $(echo "$RULE" | jq -r '.[]'); do
+            aws devicefarm get-device --arn "$ARN" --query 'device.[name,modelId]' --output text \
+              | sed 's/[[:space:]]*$//' \
+              | awk -v arn="$ARN" -F'\t' '{ m=$2; gsub(/[{}]/, "", m); gsub(/,/, "|", m); print $1 "\t" arn "\t" m }' >> devices-raw.tsv
+          done
+          LC_ALL=C sort devices-raw.tsv > devices-sorted.tsv
+          N=$(wc -l < devices-sorted.tsv)
+          [ "$N" -gt 0 ] || { echo "::error::Pool ${{ matrix.platform }} sem devices"; exit 1; }
+
+          # Um secret colado com quebra de linha vira control char ilegal no JSON do run.
+          EMAILS=$(printf '%s' "$EMAILS_CSV" | tr -d '[:space:]')
+          if [ -n "$EMAILS" ]; then
+            MODE=per-device
+            mapfile -t EMAIL_LIST < <(printf '%s' "$EMAILS" | tr ',' '\n' | sed '/^$/d')
+            if [ "$N" -gt "${#EMAIL_LIST[@]}" ]; then
+              echo "::error::$N devices no pool e ${#EMAIL_LIST[@]} e-mail(s) no CSV — dois aparelhos cairiam na mesma conta"
+              exit 1
+            fi
+          else
+            MODE=single
+            if [ -z "${TEST_USER_EMAIL:-}" ]; then
+              echo "::error::Sem TEST_USER_EMAIL nem CSV de e-mails da plataforma"
+              exit 1
+            fi
+          fi
+
+          : > devices.tsv
+          i=0
+          while IFS=$'\t' read -r NAME ARN MODEL; do
+            if [ "$MODE" = per-device ]; then EMAIL="${EMAIL_LIST[$i]}"; else EMAIL="$TEST_USER_EMAIL"; fi
+            printf '%s\t%s\t%s\t%s\n' "$NAME" "$ARN" "$MODEL" "$EMAIL" >> devices.tsv
+            echo "  $NAME ($MODEL) -> ${EMAIL%%@*}@…"
+            i=$((i+1))
+          done < devices-sorted.tsv
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Contas: modo $MODE, $N device(s) no pool ${{ matrix.platform }}"
+
+      # Android: um run para o pool inteiro. O host Android herda as environmentVariables
+      # do run (todos os devices recebem as mesmas) e o testspec as materializa em .env.
+      - name: Agenda o run (Android — um run para o pool inteiro)
+        if: matrix.platform == 'android'
+        env:
+          PROJECT_ARN: ${{ secrets.DEVICE_FARM_PROJECT_ARN }}
+          RUN_NUMBER: ${{ github.run_number }}
+          APP_ARN: ${{ steps.uploads.outputs.app_arn }}
+          PKG_ARN: ${{ steps.uploads.outputs.pkg_arn }}
+          POOL_ARN: ${{ secrets.DEVICE_FARM_DEVICE_POOL_ARN }}
+          ACCOUNT_MODE: ${{ steps.pool.outputs.mode }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+          TEST_USER_PASSWORD_IOS: ${{ secrets.TEST_USER_PASSWORD_IOS }}
+          TEST_USER_PIN: ${{ secrets.TEST_USER_PIN }}
+          BUILD_PROFILE_ANDROID: ${{ secrets.BUILD_PROFILE_ANDROID }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/devicefarm-upload.sh
+          SPEC_ARN=$(df_upload "spec-${RUN_NUMBER}.yml" APPIUM_NODE_TEST_SPEC testspec.yml)
+
+          # Valor vazio vira {"value":""} e o schedule-run responde com um ParamValidation
+          # que só aponta o índice do array. Expansão indireta de propósito: eval perde a
+          # barra e $$ vira o PID, que nunca é vazio.
+          for v in TEST_USER_PASSWORD TEST_USER_PIN; do
+            [ -n "${!v}" ] || { echo "::error::Secret $v vazio"; exit 1; }
+          done
+          ENV_ARGS=(--arg pass "$TEST_USER_PASSWORD" --arg pin "$TEST_USER_PIN")
+          ENV_ITEMS='{name:"TEST_USER_PASSWORD",value:$pass},{name:"TEST_USER_PIN",value:$pin}'
+          if [ -n "${TEST_USER_EMAIL:-}" ]; then
+            ENV_ARGS+=(--arg email "$TEST_USER_EMAIL")
+            ENV_ITEMS+=',{name:"TEST_USER_EMAIL",value:$email}'
+          fi
+          # Senha da trilha de production + o profile do build: o runtime escolhe
+          # (test/utils/credentials.ts) — a senha comum só vale no build de development.
+          if [ -n "${TEST_USER_PASSWORD_IOS:-}" ]; then
+            ENV_ARGS+=(--arg passprod "$TEST_USER_PASSWORD_IOS")
+            ENV_ITEMS+=',{name:"TEST_USER_PASSWORD_IOS",value:$passprod}'
+          fi
+          if [ -n "${BUILD_PROFILE_ANDROID:-}" ]; then
+            ENV_ARGS+=(--arg profile "$BUILD_PROFILE_ANDROID")
+            ENV_ITEMS+=',{name:"BUILD_PROFILE_ANDROID",value:$profile}'
+          fi
+          # Versão/build/profile do EAS (step "Baixa o build") → environment.properties do Allure.
+          for v in APP_VERSION APP_BUILD_VERSION APP_BUILD_PROFILE; do
+            if [ -n "${!v:-}" ]; then
+              ENV_ARGS+=(--arg "$v" "${!v}")
+              ENV_ITEMS+=",{name:\"$v\",value:\$$v}"
+            fi
+          done
+          if [ "$ACCOUNT_MODE" = per-device ]; then
+            # As duas listas na MESMA ordem do devices.tsv: é com elas que o aparelho acha
+            # o próprio índice (test/utils/credentials.ts). O Device Farm limita cada
+            # variável a 256 caracteres — por isso CSV, e nunca JSON em base64.
+            EMAILS=$(cut -f4 devices.tsv | paste -sd, -)
+            MODELS=$(cut -f3 devices.tsv | paste -sd, -)
+            for v in EMAILS MODELS; do
+              VALUE="${!v}"
+              if [ "${#VALUE}" -gt 256 ]; then
+                echo "::error::$v tem ${#VALUE} caracteres; o Device Farm aceita até 256 por variável"
+                exit 1
+              fi
             done
-            echo "::error::Timeout no upload $name" >&2; return 1
-          }
-
-          APP_ARN=$(upload "app-${RUN_NUMBER}.${APP_FILE##*.}" "$APP_TYPE" "$APP_FILE")
-          TEST_ARN=$(upload "tests-${RUN_NUMBER}.zip" APPIUM_NODE_TEST_PACKAGE test-package.zip)
-          SPEC_ARN=$(upload "spec-${RUN_NUMBER}.yml" APPIUM_NODE_TEST_SPEC "$TESTSPEC")
-
-          # Injeta as credenciais como environmentVariables — o testspec as materializa em .env.
-          # Só variáveis com valor entram aqui: a API do Device Farm valida
-          # `min length: 1` e rejeita o schedule-run inteiro se algum value vier vazio.
-          ENV_JSON=$(jq -nc \
-            --arg email "$TEST_USER_EMAIL" \
-            --arg pass  "$TEST_USER_PASSWORD" \
-            --arg pin   "$TEST_USER_PIN" \
-            '{environmentVariables:[
-              {name:"TEST_USER_EMAIL",value:$email},
-              {name:"TEST_USER_PASSWORD",value:$pass},
-              {name:"TEST_USER_PIN",value:$pin}
-            ]}')
+            ENV_ARGS+=(--arg emails "$EMAILS" --arg models "$MODELS")
+            ENV_ITEMS+=',{name:"TEST_USER_EMAILS",value:$emails},{name:"TEST_USER_DEVICE_MODELS",value:$models}'
+          fi
+          ENV_JSON=$(jq -nc "${ENV_ARGS[@]}" "{environmentVariables:[$ENV_ITEMS]}")
 
           TEST_JSON=$(jq -nc \
-            --arg tp "$TEST_ARN" --arg ts "$SPEC_ARN" \
+            --arg tp "$PKG_ARN" --arg ts "$SPEC_ARN" \
             '{type:"APPIUM_NODE",testPackageArn:$tp,testSpecArn:$ts}')
 
           RUN_ARN=$(aws devicefarm schedule-run \
             --project-arn "$PROJECT_ARN" \
             --app-arn "$APP_ARN" \
             --device-pool-arn "$POOL_ARN" \
-            --name "CI ${{ matrix.platform }} #${RUN_NUMBER}" \
+            --name "CI android #${RUN_NUMBER}" \
             --test "$TEST_JSON" \
             --configuration "$ENV_JSON" \
             --query 'run.arn' --output text)
-          echo "run_arn=$RUN_ARN" >> "$GITHUB_OUTPUT"
+          printf 'pool\t%s\n' "$RUN_ARN" > runs.tsv
           echo "Run agendado: $RUN_ARN"
 
-      - name: Aguarda o run terminar
+      # iOS: um run por iPhone. Duas limitações medidas do Device Farm (projeto de
+      # referência MobileWDIO, "CI iOS Run #6"): as environmentVariables são do run, não
+      # do job, e o host iOS NEM as recebe — o script que a AWS gera só exporta
+      # DEVICEFARM_*. Logo o aparelho não tem como descobrir a própria conta: o CI decide
+      # por ele e injeta e-mail, senha, PIN e o nome do aparelho no testspec daquele run.
+      # Um único pacote de testes serve a todos; só o testspec muda.
+      - name: Agenda os runs (iOS — um run por iPhone)
+        if: matrix.platform == 'ios'
         env:
-          RUN_ARN: ${{ steps.schedule.outputs.run_arn }}
+          PROJECT_ARN: ${{ secrets.DEVICE_FARM_PROJECT_ARN }}
+          RUN_NUMBER: ${{ github.run_number }}
+          APP_ARN: ${{ steps.uploads.outputs.app_arn }}
+          PKG_ARN: ${{ steps.uploads.outputs.pkg_arn }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+          TEST_USER_PASSWORD_IOS: ${{ secrets.TEST_USER_PASSWORD_IOS }}
+          TEST_USER_PIN: ${{ secrets.TEST_USER_PIN }}
         run: |
           set -euo pipefail
-          REACHED_TERMINAL=false
-          STATUS=""; RESULT_VAL=""
-          for i in $(seq 1 120); do
-            READ=$(aws devicefarm get-run --arn "$RUN_ARN" --query 'run.[status,result]' --output text)
-            STATUS=$(echo "$READ" | awk '{print $1}')
-            RESULT_VAL=$(echo "$READ" | awk '{print $2}')
-            echo "Status ($i/120): $STATUS / $RESULT_VAL"
-            case "$STATUS" in
-              PENDING|PENDING_CONCURRENCY|PENDING_DEVICE|PREPARING|RUNNING|SCHEDULING) sleep 60 ;;
-              *) REACHED_TERMINAL=true; break ;;
-            esac
+          source .github/scripts/devicefarm-upload.sh
+          # A senha da conta é outra no iOS (TEST_USER_PASSWORD só vale no Android de
+          # development — medido em 2026-09-16). SEM fallback: no run #30 o secret
+          # TEST_USER_PASSWORD_IOS não existia, o host recebeu a senha Android em silêncio e
+          # os 5 iPhones falharam no login. Secret ausente tem que parar AQUI, com nome.
+          for v in TEST_USER_PASSWORD_IOS TEST_USER_PIN; do
+            [ -n "${!v}" ] || { echo "::error::Secret $v vazio ou inexistente — crie-o em Settings > Secrets and variables > Actions > Secrets (senha da conta de teste no iOS)"; exit 1; }
           done
-          if [ "$REACHED_TERMINAL" != "true" ]; then
-            echo "::error::Timeout aguardando o Device Farm (último status: $STATUS)."
+          # O host recebe a senha iOS como TEST_USER_PASSWORD (nome que o .env/credentials.ts leem).
+          TEST_USER_PASSWORD="$TEST_USER_PASSWORD_IOS"
+
+          MARKER_LINE=$(grep -n '^      - __CREDENCIAIS_DO_RUN__$' testspec-ios.yml | cut -d: -f1)
+          if [ -z "$MARKER_LINE" ]; then
+            echo "::error::testspec-ios.yml sem a linha marcadora '      - __CREDENCIAIS_DO_RUN__'"
             exit 1
           fi
-          echo "::notice::Device Farm ${{ matrix.platform }}: $RESULT_VAL — ver relatório Allure"
-          echo "**Device Farm (${{ matrix.platform }}):** \`$RESULT_VAL\` — o resultado reflete no relatório, não quebra a esteira." >> "$GITHUB_STEP_SUMMARY"
+
+          : > runs.tsv
+          IDX=0
+          exec 3< devices.tsv
+          while IFS=$'\t' read -u 3 -r NAME ARN MODEL EMAIL; do
+            IDX=$((IDX+1))
+            # Fora do workspace: o testspec gerado nunca pode entrar num zip.
+            SPEC="$RUNNER_TEMP/testspec-ios-run${RUN_NUMBER}-${IDX}.yml"
+
+            # printf %q devolve cada valor já citado para reuso em shell (apóstrofo, espaço,
+            # aspas, $ e barra invertida na senha ou no e-mail). O comando entra no YAML
+            # como bloco literal (`- |-`): num escalar simples, um " #" dentro da senha
+            # viraria comentário e truncaria a linha. head/tail em vez de sed/awk: eles
+            # reinterpretariam os escapes do %q.
+            EXPORT_LINE=$(printf '        export TEST_USER_EMAIL=%q TEST_USER_PASSWORD=%q TEST_USER_PIN=%q DEVICE_LABEL=%q APP_VERSION=%q APP_BUILD_VERSION=%q APP_BUILD_PROFILE=%q' \
+              "$EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" "$NAME" "${APP_VERSION:-}" "${APP_BUILD_VERSION:-}" "${APP_BUILD_PROFILE:-}")
+            {
+              head -n "$((MARKER_LINE - 1))" testspec-ios.yml
+              printf '      - |-\n%s\n' "$EXPORT_LINE"
+              tail -n "+$((MARKER_LINE + 1))" testspec-ios.yml
+            } > "$SPEC"
+            if grep -q '^      - __CREDENCIAIS_DO_RUN__$' "$SPEC" || ! grep -q '^        export TEST_USER_EMAIL=' "$SPEC"; then
+              echo "::error::Falha ao injetar as credenciais no testspec de $NAME"
+              exit 1
+            fi
+
+            SPEC_ARN=$(df_upload "spec-${RUN_NUMBER}-${IDX}.yml" APPIUM_NODE_TEST_SPEC "$SPEC")
+            # Mira UM aparelho pelo ARN, sem criar um device pool de 1 device para cada.
+            # Plano B, se a conta AWS recusar o parâmetro: create-device-pool com uma regra
+            # "ARN IN" por aparelho e --device-pool-arn.
+            SELECTION=$(jq -nc --arg arn "$ARN" \
+              '{filters:[{attribute:"ARN",operator:"IN",values:[$arn]}],maxDevices:1}')
+            TEST_JSON=$(jq -nc \
+              --arg tp "$PKG_ARN" --arg ts "$SPEC_ARN" \
+              '{type:"APPIUM_NODE",testPackageArn:$tp,testSpecArn:$ts}')
+            # Sem --configuration: o host iOS não receberia as variáveis mesmo.
+            RUN_ARN=$(aws devicefarm schedule-run \
+              --project-arn "$PROJECT_ARN" \
+              --app-arn "$APP_ARN" \
+              --device-selection-configuration "$SELECTION" \
+              --name "CI ios #${RUN_NUMBER} - ${NAME}" \
+              --test "$TEST_JSON" \
+              --query 'run.arn' --output text)
+            printf '%s\t%s\n' "$NAME" "$RUN_ARN" >> runs.tsv
+            echo "Run agendado para $NAME: $RUN_ARN"
+          done
+          exec 3<&-
+          echo "$IDX run(s) iOS agendado(s)"
+
+      # runs.tsv tem 1 linha no Android (o pool) e N no iOS (um por iPhone). Os runs iOS
+      # correm em paralelo no Device Farm: o tempo de parede é o do aparelho mais lento.
+      - name: Aguarda os runs terminarem
+        run: |
+          set -euo pipefail
+          [ -s runs.tsv ] || { echo "::error::Nenhum run agendado (runs.tsv vazio)"; exit 1; }
+          ALL_DONE=false
+          for i in $(seq 1 120); do
+            PENDING=0
+            LINES=""
+            exec 3< runs.tsv
+            while IFS=$'\t' read -u 3 -r LABEL RUN_ARN; do
+              READ=$(aws devicefarm get-run --arn "$RUN_ARN" --query 'run.[status,result]' --output text)
+              STATUS=$(echo "$READ" | awk '{print $1}')
+              RESULT_VAL=$(echo "$READ" | awk '{print $2}')
+              case "$STATUS" in
+                PENDING|PENDING_CONCURRENCY|PENDING_DEVICE|PREPARING|RUNNING|SCHEDULING) PENDING=$((PENDING+1)) ;;
+              esac
+              LINES+="  $LABEL: $STATUS / $RESULT_VAL"$'\n'
+            done
+            exec 3<&-
+            echo "Poll $i/120:"; printf '%s' "$LINES"
+            if [ "$PENDING" -eq 0 ]; then ALL_DONE=true; break; fi
+            sleep 60
+          done
+          if [ "$ALL_DONE" != "true" ]; then
+            echo "::error::Timeout aguardando o Device Farm (${{ matrix.platform }})."
+            exit 1
+          fi
+
+          # O resultado do teste reflete no relatório; só timeout quebra a esteira.
+          echo "**Device Farm (${{ matrix.platform }}):** o resultado reflete no relatório, não quebra a esteira." >> "$GITHUB_STEP_SUMMARY"
+          exec 3< runs.tsv
+          while IFS=$'\t' read -u 3 -r LABEL RUN_ARN; do
+            RESULT_VAL=$(aws devicefarm get-run --arn "$RUN_ARN" --query 'run.result' --output text)
+            echo "::notice::Device Farm ${{ matrix.platform }} ($LABEL): $RESULT_VAL — ver relatório Allure"
+            echo "- \`$RESULT_VAL\` — $LABEL" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exec 3<&-
 
       - name: Coleta artefatos (Allure) do Device Farm
         if: always()
-        env:
-          RUN_ARN: ${{ steps.schedule.outputs.run_arn }}
         run: |
           set -uo pipefail
           mkdir -p artifacts allure-results
-          [ -z "${RUN_ARN:-}" ] && { echo "Sem run_arn — pulando coleta"; exit 0; }
+          [ -s runs.tsv ] || { echo "Sem runs.tsv — pulando coleta"; exit 0; }
           i=0
-          for JOB_ARN in $(aws devicefarm list-jobs --arn "$RUN_ARN" --query 'jobs[].arn' --output text); do
-            SUITE_ARN=$(aws devicefarm list-suites --arn "$JOB_ARN" \
-              --query "suites[?name=='Tests Suite'].arn | [0]" --output text)
-            [ -z "$SUITE_ARN" ] || [ "$SUITE_ARN" = "None" ] && { i=$((i+1)); continue; }
-            TEST_ARN=$(aws devicefarm list-tests --arn "$SUITE_ARN" --query 'tests[0].arn' --output text)
-            URL=$(aws devicefarm list-artifacts --arn "$TEST_ARN" --type FILE \
-              --query "artifacts[?name=='Customer Artifacts'].url | [0]" --output text)
-            if [ -n "$URL" ] && [ "$URL" != "None" ]; then
-              curl -sL --retry 3 --max-time 180 "$URL" -o "artifacts/ca-$i.zip" || true
-              unzip -o "artifacts/ca-$i.zip" -d "artifacts/ca-$i" >/dev/null 2>&1 || true
-              # Os allure-results ficam em algum nível dentro do $DEVICEFARM_LOG_DIR extraído.
-              find "artifacts/ca-$i" -type d -name allure-results -exec cp -r {}/. allure-results/ \; 2>/dev/null || true
-            fi
-            i=$((i+1))
+          SPEC_OUTPUT_URL=""
+          # Laço externo sobre os runs (1 no Android, N no iOS); dentro, os jobs de cada um.
+          exec 3< runs.tsv
+          while IFS=$'\t' read -u 3 -r LABEL RUN_ARN; do
+            for JOB_ARN in $(aws devicefarm list-jobs --arn "$RUN_ARN" --query 'jobs[].arn' --output text); do
+              SUITE_ARN=$(aws devicefarm list-suites --arn "$JOB_ARN" \
+                --query "suites[?name=='Tests Suite'].arn | [0]" --output text)
+              [ -z "$SUITE_ARN" ] || [ "$SUITE_ARN" = "None" ] && { i=$((i+1)); continue; }
+              TEST_ARN=$(aws devicefarm list-tests --arn "$SUITE_ARN" --query 'tests[0].arn' --output text)
+              URL=$(aws devicefarm list-artifacts --arn "$TEST_ARN" --type FILE \
+                --query "artifacts[?name=='Customer Artifacts'].url | [0]" --output text)
+              if [ -n "$URL" ] && [ "$URL" != "None" ]; then
+                curl -sL --retry 3 --max-time 180 "$URL" -o "artifacts/ca-$i.zip" || true
+                unzip -o "artifacts/ca-$i.zip" -d "artifacts/ca-$i" >/dev/null 2>&1 || true
+                # Os allure-results ficam em algum nível dentro do $DEVICEFARM_LOG_DIR extraído.
+                # -n (no-clobber): resultados e anexos têm nome UUID, únicos entre devices.
+                find "artifacts/ca-$i" -type d -name allure-results -exec cp -rn {}/. allure-results/ \; 2>/dev/null || true
+              fi
+              # iOS: o host macos_tahoe não tem ffmpeg, então o XCUITest não grava (wdio.conf.ts
+              # pula a gravação). O Device Farm grava a sessão inteira por job (artefato VIDEO,
+              # h264, ~3 MB por iPhone medido no run #30) — anexa esse .mp4 a cada resultado
+              # deste aparelho. O step "Re-encoda vídeos" normaliza o tamanho como no Android.
+              if [ "${{ matrix.platform }}" = "ios" ]; then
+                VIDEO_URL=$(aws devicefarm list-artifacts --arn "$TEST_ARN" --type FILE \
+                  --query "artifacts[?type=='VIDEO'].url | [0]" --output text)
+                VIDEO_FILE="devicefarm-video-$i.mp4"
+                if [ -n "$VIDEO_URL" ] && [ "$VIDEO_URL" != "None" ] \
+                   && curl -sL --retry 3 --max-time 300 "$VIDEO_URL" -o "allure-results/$VIDEO_FILE"; then
+                  N_ATTACHED=0
+                  while IFS= read -r -u 4 RESULT; do
+                    NAME=$(basename "$RESULT")
+                    [ -f "allure-results/$NAME" ] || continue
+                    jq --arg src "$VIDEO_FILE" \
+                      '.attachments = ((.attachments // []) + [{"name":"Vídeo da execução (Device Farm — sessão do aparelho)","source":$src,"type":"video/mp4"}])' \
+                      "allure-results/$NAME" > "allure-results/$NAME.tmp" && mv "allure-results/$NAME.tmp" "allure-results/$NAME"
+                    N_ATTACHED=$((N_ATTACHED+1))
+                  done 4< <(find "artifacts/ca-$i" -path '*allure-results/*-result.json' -type f)
+                  echo "$LABEL: vídeo do Device Farm anexado a $N_ATTACHED resultado(s)"
+                else
+                  echo "::warning::$LABEL: sem artefato VIDEO no Device Farm — resultados ficam sem vídeo"
+                  rm -f "allure-results/$VIDEO_FILE"
+                fi
+              fi
+              # Guarda o log do testspec do primeiro device para diagnóstico (ver abaixo).
+              if [ -z "$SPEC_OUTPUT_URL" ]; then
+                SPEC_OUTPUT_URL=$(aws devicefarm list-artifacts --arn "$TEST_ARN" --type FILE \
+                  --query "artifacts[?name=='Test spec output'].url | [0]" --output text)
+              fi
+              i=$((i+1))
+            done
           done
-          echo "allure-results coletados: $(ls -1 allure-results | wc -l) arquivos"
+          exec 3<&-
+          COLLECTED=$(find allure-results -maxdepth 1 -type f -name '*-result.json' | wc -l)
+          echo "allure-results coletados: $(ls -1 allure-results | wc -l) arquivos ($COLLECTED *-result.json) de $i job(s)"
+
+          # Nenhum resultado = o WDIO morreu antes do primeiro teste (ex.: módulo ausente por
+          # lockfile inconsistente, credencial que não chegou ao host). O motivo está no
+          # "Test spec output" do Device Farm, que até aqui só era visível no console da
+          # AWS — imprime o fim dele no log do job.
+          if [ "$COLLECTED" -eq 0 ] && [ -n "$SPEC_OUTPUT_URL" ] && [ "$SPEC_OUTPUT_URL" != "None" ]; then
+            echo "::group::Test spec output (últimas 40 linhas — nenhum *-result.json coletado)"
+            curl -sL --retry 3 --max-time 60 "$SPEC_OUTPUT_URL" | tail -n 40 || true
+            echo "::endgroup::"
+          fi
 
       - name: Publica allure-results como artifact
         if: always()
@@ -331,8 +652,8 @@ jobs:
           # a presença de *-result.json.
           for PLAT in android ios; do
             SRC="allure-results-$PLAT"
-            # Diretório ausente = plataforma não rodou nesta run (o iOS é opcional, via input
-            # run_ios). Isso é esperado e não merece anotação — só o caso abaixo merece.
+            # Diretório ausente = o job da plataforma não chegou a publicar o artifact (falhou
+            # antes da coleta). Não merece anotação — só o caso abaixo merece.
             if [ ! -d "$SRC" ]; then
               echo "$PLAT: não executado nesta run"
               continue
@@ -483,12 +804,15 @@ jobs:
           PRUNED_LIST="$RUNNER_TEMP/pruned-runs.txt"
           : > "$PRUNED_LIST"
 
-          # --- Guarda: nada gerado -> não publica, mas explica claramente o motivo ---
+          # --- Guarda: nada gerado -> falha do job, não "nada a publicar" ---
+          # Era ::warning:: + exit 0, e o job ficava verde: os runs #16, #17 e #18 rodaram
+          # no Device Farm sem executar um teste sequer (WDIO morreu no import) e ninguém
+          # notou por três semanas. Um run que rodou e não trouxe resultado é falha de infra.
           if [ ! -d "allure-report-android" ] && [ ! -d "allure-report-ios" ]; then
-            MSG="Nenhuma plataforma produziu *-result.json — relatório não publicado nesta run."
-            echo "::warning::$MSG"
-            echo "**Publicação:** $MSG" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            MSG="Nenhuma plataforma produziu *-result.json — relatório não publicado nesta run. Veja o log 'Test spec output' no step 'Coleta artefatos' do job device-farm."
+            echo "::error::$MSG"
+            echo "**Publicação:** FALHOU — $MSG" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
           cd reports-branch

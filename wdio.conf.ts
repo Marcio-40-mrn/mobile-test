@@ -1,18 +1,38 @@
+import { Options } from '@wdio/types';
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import allureReporter from '@wdio/allure-reporter';
+import allureReporter, {
+  addArgument,
+  addHistoryId,
+  addLabel,
+  addParentSuite,
+  addTestCaseId,
+} from '@wdio/allure-reporter';
 // allure-commandline não publica tipos; import via require tipado como função.
 const allureCommandline: (args: string[]) => import('child_process').ChildProcess =
   require('allure-commandline');
 import 'dotenv/config';
-import { IS_IOS, ANDROID_APP_ID, requireRemoteIosSession } from './test/support/platform';
-import { BUILD_DEST } from './scripts/download-build';
+import { APP_ID } from './test/utils/platform';
+import { deviceLabel } from './test/utils/device-name';
+import { emailPrefix, resolveAccount } from './test/utils/credentials';
+import {
+  BuildInfo,
+  buildInfoFromEnv,
+  environmentProperties,
+  installedAndroidBuildInfo,
+} from './test/utils/build-info';
 
 // ─── Detecção de ambiente ────────────────────────────────────────────────────
 // O AWS Device Farm injeta variáveis DEVICEFARM_* no host de teste. A presença
 // do UDID do device é o sinal mais confiável de que estamos rodando lá.
+//
+// isRemote é o modo "Remote Access": uma sessão interativa do Device Farm, cujo
+// endpoint Appium é acessado por URL pré-assinada. Serve para validar a suíte iOS
+// localmente, sem esperar um run completo do CI.
 const isDeviceFarm = Boolean(process.env.DEVICEFARM_DEVICE_UDID);
+const isIOS = process.env.PLATFORM === 'ios';
+const isRemote = isIOS && Boolean(process.env.REMOTE_HOST);
 
 // No Device Farm todos os artefatos precisam ir para $DEVICEFARM_LOG_DIR para
 // serem coletados como artifacts; localmente ficam em ./reports e ./test/screenshots.
@@ -29,7 +49,9 @@ const SCREENSHOTS_DIR = isDeviceFarm
 const VIDEOS_DIR = isDeviceFarm
   ? LOG_DIR
   : path.join(process.cwd(), 'test', 'videos');
-const APK_PATH = BUILD_DEST.android;
+// APK instalado no AVD local. ARYS_APK_PATH aponta outro build (ex.: o que já está
+// no emulador) sem sobrescrever o download padrão — ver CONCERNS.md §8.
+const APK_PATH = process.env.ARYS_APK_PATH ?? 'C:\\dev\\apk_arys\\arys-latest.apk';
 
 // Gera um nome de arquivo seguro (sem caracteres especiais) a partir do teste,
 // com timestamp — reutilizado por vídeo e screenshot.
@@ -40,59 +62,119 @@ function testFileBaseName(test: { fullName?: string; parent?: string; title?: st
   return `${safeName}_${timestamp}`;
 }
 
+// environment.properties = widget "Environment" do relatório (versão/build/profile do app).
+function writeAllureEnvironment(info: BuildInfo): void {
+  const environment = isDeviceFarm ? 'AWS Device Farm' : isRemote ? 'Remote Access' : 'Local (AVD)';
+  fs.mkdirSync(ALLURE_RESULTS_DIR, { recursive: true });
+  fs.writeFileSync(
+    path.join(ALLURE_RESULTS_DIR, 'environment.properties'),
+    environmentProperties(info, { environment, isIOS }),
+  );
+  console.log(
+    `[allure] environment.properties: ${environment}, app ${info.appVersion ?? 'n/d'} (${info.appBuildVersion ?? 'n/d'}), profile ${info.buildProfile ?? 'n/d'}`,
+  );
+}
+
+// Um nó por aparelho no Allure. Os N devices do pool rodam o mesmo teste com o
+// mesmo título; sem historyId/testCaseId próprios o Allure os colapsa num teste só
+// com "retries". O rótulo vem do host ou do CI (test/utils/device-name.ts) — nada
+// de nome de aparelho no código. addArgument não altera o historyId nesta versão,
+// por isso os dois ids são setados explicitamente.
+async function labelTestWithDevice(test: { parent?: string; title?: string }): Promise<void> {
+  try {
+    const device = deviceLabel();
+    const id = `${test.parent ?? ''} ${test.title ?? ''}::${device}`;
+    await addHistoryId(id);
+    await addTestCaseId(id);
+    await addParentSuite(`${device} — ${emailPrefix(resolveAccount().email)}`);
+    await addArgument('Device', device);
+    addLabel('host', device);
+  } catch (e) {
+    console.warn('[allure] Falha ao rotular o teste com o device:', e);
+  }
+}
+
 // ─── Capabilities ────────────────────────────────────────────────────────────
-// Três alvos de execução:
-//   1. Android local      — AVD nesta máquina, APK baixado do EAS
-//   2. Android/iOS no CI  — AWS Device Farm; deviceName/app/udid/platformVersion
-//                           vêm do Appium via `--default-capabilities` no testspec
-//   3. iOS local          — sessão aberta manualmente no Device Farm; conectamos
-//                           no Appium dela (REMOTE_HOST/REMOTE_PORT), com o app em
-//                           REMOTE_PATH_IOS. XCUITest exige host macOS, então não
-//                           há Appium local envolvido.
+// No Device Farm, deviceName/app/udid/platformVersion são fornecidos pelo Appium
+// via `--default-capabilities` no testspec; aqui só declaramos o que não vem
+// de lá. Localmente apontamos o device fixo e o APK baixado do EAS.
 const androidCapability = {
   platformName: 'Android',
   'appium:automationName': 'UiAutomator2',
-  'appium:appPackage': ANDROID_APP_ID,
-  'appium:appActivity': `${ANDROID_APP_ID}.MainActivity`,
+  'appium:appPackage': APP_ID,
+  'appium:appActivity': `${APP_ID}.MainActivity`,
   'appium:noReset': true,
 };
 
-const localCapability = {
+const androidLocalCapability = {
   ...androidCapability,
   'appium:deviceName': 'S25Ultra_API35',
   'appium:app': APK_PATH,
   'appium:enforceAppInstall': true,
 };
 
-const iosBaseCapability = {
+const iosCapability = {
   platformName: 'iOS',
   'appium:automationName': 'XCUITest',
+  'appium:bundleId': APP_ID,
   'appium:noReset': true,
-  // Absorve os alertas nativos de permissão (notificações, contatos), que no
-  // Android não aparecem porque o fluxo cancela o modal do app antes.
-  'appium:autoAcceptAlerts': true,
-  // O WebDriverAgent precisa ser compilado/assinado no primeiro boot do host.
-  'appium:wdaLaunchTimeout': 240000,
-  'appium:wdaConnectionTimeout': 240000,
 };
 
-// Nos dois alvos iOS o app é identificado por CAMINHO, nunca por bundle id:
-// no Device Farm o testspec já passa `appium:app = $DEVICEFARM_APP_PATH` nas
-// --default-capabilities, então aqui não declaramos app nenhum; na sessão remota
-// o caminho vem de REMOTE_PATH_IOS.
-const remoteIosSession = IS_IOS && !isDeviceFarm ? requireRemoteIosSession() : null;
+// Escolhe as capabilities do ambiente corrente — do caso mais específico ao menos.
+function buildCapabilities(): Record<string, unknown>[] {
+  if (isDeviceFarm && isIOS) {
+    // O WDA precisa vir pré-compilado do host mac do Device Farm; sem estas duas
+    // capabilities o xcodebuild tenta compilá-lo na hora e falha com "code 70".
+    return [{
+      ...iosCapability,
+      'appium:usePrebuiltWDA': true,
+      // O caminho vem do testspec-ios.yml (fase pre_test), que escolhe o WDA pela
+      // versão major do driver XCUITest e exporta DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH;
+      // os nomes DEVICEFARM_WDA_DERIVED_DATA_PATH* são do host legado (fallback).
+      'appium:derivedDataPath':
+        process.env.DEVICEFARM_APPIUM_WDA_DERIVED_DATA_PATH ??
+        process.env.DEVICEFARM_WDA_DERIVED_DATA_PATH_V9 ??
+        process.env.DEVICEFARM_WDA_DERIVED_DATA_PATH,
+      // Log do xcodebuild no appium.log — diagnóstico do WDA (igual à referência MobileWDIO).
+      'appium:showXcodeLog': true,
+    }];
+  }
+  if (isDeviceFarm) return [androidCapability];
+  if (isIOS) {
+    // Remote Access: o app já está instalado na sessão e o endpoint rejeita
+    // `usePrebuiltWDA` como capability reservada — passá-la derruba a sessão.
+    return [{ ...iosCapability, 'appium:newCommandTimeout': 1200 }];
+  }
+  return [androidLocalCapability];
+}
 
-const capability = IS_IOS
-  ? remoteIosSession
-    ? { ...iosBaseCapability, 'appium:app': remoteIosSession.app }
-    : iosBaseCapability
-  : isDeviceFarm
-    ? androidCapability
-    : localCapability;
+// No Device Farm o Appium já está no ar (subido pelo testspec na fase pre_test)
+// em localhost:4723. Em Remote Access falamos com o endpoint pré-assinado por
+// HTTPS. Localmente o appium service gerencia host/porta sozinho.
+function buildConnectionSettings(): Partial<Options.Testrunner> {
+  if (isRemote) {
+    return {
+      protocol: 'https',
+      hostname: process.env.REMOTE_HOST,
+      port: Number(process.env.REMOTE_PORT ?? 443),
+      path: process.env.REMOTE_PATH_IOS,
+    };
+  }
+  if (isDeviceFarm) {
+    return { hostname: 'localhost', port: 4723, path: '/' };
+  }
+  return {};
+}
+
+// O Appium local só sobe quando o servidor não é externo.
+function buildServices(): Options.Testrunner['services'] {
+  if (isDeviceFarm || isRemote) return [];
+  return [['appium', { command: 'appium', args: { relaxedSecurity: true } }]];
+}
 
 // ─── Reporters ───────────────────────────────────────────────────────────────
 // html-nice só faz sentido em execução local; no Device Farm publicamos via Allure.
-const reporters: WebdriverIO.Config['reporters'] = ['spec'];
+const reporters: Options.Testrunner['reporters'] = ['spec'];
 if (!isDeviceFarm) {
   reporters.push([
     'html-nice',
@@ -115,25 +197,27 @@ reporters.push([
   },
 ]);
 
-export const config: WebdriverIO.Config = {
+export const config: Options.Testrunner = {
   runner: 'local',
-  // `autoCompileOpts` foi removido no WDIO 8 e nenhum pacote da v9 o lê — o
-  // runner detecta e registra o TypeScript sozinho a partir do tsconfig.json.
+  autoCompileOpts: {
+    autoCompile: true,
+    tsNodeOpts: {
+      project: './tsconfig.json',
+      transpileOnly: true,
+    },
+  },
 
-  // DUMP_SOURCE=true troca a suíte inteira pelo spec de coleta de page source.
-  // Não é acionado pelo CI: use `npm run dump:ios` / `npm run dump:android`.
-  specs: process.env.DUMP_SOURCE === 'true'
-    ? ['./test/specs/dump-source.spec.ts']
-    : [
-        './test/specs/00-update-check.spec.ts',
-        './test/specs/login.spec.ts',
-        './test/specs/home.spec.ts',
-        './test/specs/clientes.spec.ts',
-      ],
+  specs: [
+    './test/specs/login.spec.ts',
+    './test/specs/home.spec.ts',
+    './test/specs/clientes.spec.ts',
+  ],
 
   maxInstances: 1,
 
-  capabilities: [capability],
+  capabilities: buildCapabilities(),
+
+  ...buildConnectionSettings(),
 
   logLevel: 'warn',
   bail: 0,
@@ -142,12 +226,7 @@ export const config: WebdriverIO.Config = {
   connectionRetryTimeout: 120000,
   connectionRetryCount: 3,
 
-  // O appium service só sobe um servidor local no alvo Android local. No Device
-  // Farm o Appium é iniciado pelo testspec, e na sessão iOS remota ele já está no
-  // ar no host da sessão.
-  services: isDeviceFarm || remoteIosSession
-    ? []
-    : [['appium', { command: 'appium', args: { relaxedSecurity: true } }]],
+  services: buildServices(),
 
   framework: 'mocha',
 
@@ -155,31 +234,49 @@ export const config: WebdriverIO.Config = {
 
   mochaOpts: {
     ui: 'bdd',
-    timeout: isDeviceFarm ? 600000 : 120000,
+    // O `it` de clientes (4 abas × 7 filtros) mediu 529 s no AVD com o build 1.6.0 (138)
+    // e estourou 600 s duas vezes em 2026-09-18; o Device Farm é mais lento que o AVD.
+    timeout: 1200000,
   },
 
   onPrepare: async function () {
-    // No Device Farm o app já é instalado no device pelo próprio serviço.
-    if (isDeviceFarm) return;
+    // No Device Farm o app já é instalado no device pelo próprio serviço, e no
+    // iOS não há o que baixar aqui: o .ipa vem do Device Farm (CI) ou já está
+    // instalado na sessão de Remote Access. Versão/build/profile chegam pelo
+    // ambiente (o CI os extrai do EAS) — ver test/utils/build-info.ts.
+    if (isDeviceFarm || isIOS) {
+      writeAllureEnvironment(buildInfoFromEnv());
+      return;
+    }
 
     fs.rmSync(ALLURE_RESULTS_DIR, { recursive: true, force: true });
-    // O download/install local é específico de Android (EAS APK + adb); iOS não
-    // tem caminho local — buildIosCapability() já teria falhado antes daqui.
-    if (IS_IOS) return;
-    if (process.env.SKIP_DOWNLOAD === 'true') return;
+    if (process.env.SKIP_DOWNLOAD === 'true') {
+      // Sem download, a versão é a do APK que já está no emulador.
+      writeAllureEnvironment({ ...buildInfoFromEnv(), ...installedAndroidBuildInfo() });
+      return;
+    }
 
     const { downloadLatestBuild } = await import('./scripts/download-build');
-    await downloadLatestBuild();
+    const info = await downloadLatestBuild();
     console.log('[install] Instalando APK no device...');
     execSync(`adb install -r "${APK_PATH}"`, { stdio: 'inherit' });
     console.log('[install] APK instalado.');
+    writeAllureEnvironment(info);
   },
 
-  beforeTest: async function () {
+  beforeTest: async function (test) {
+    await labelTestWithDevice(test);
+
+    // Remote Access não suporta gravação de tela. No Device Farm iOS o XCUITest
+    // exige ffmpeg no host e o macos_tahoe não tem (run #30: "'ffmpeg' binary is
+    // not found in PATH"); o vídeo vem do artefato VIDEO que o próprio Device Farm
+    // grava por job — o step "Coleta artefatos" o anexa aos resultados do aparelho.
+    if (isRemote || (isDeviceFarm && isIOS)) return;
+
     // Inicia a gravação de tela. Envolto em try/catch para que uma falha na
     // gravação nunca derrube o teste em si.
     try {
-      if (isDeviceFarm && !IS_IOS) {
+      if (isDeviceFarm && !isIOS) {
         // No Device Farm Android o screenrecord nativo (startRecordingScreen)
         // trunca o vídeo em ~37s na troca de surface do app. MediaProjection
         // sobrevive a isso e grava a sessão inteira.
@@ -191,18 +288,11 @@ export const config: WebdriverIO.Config = {
         // (não mexe na qualidade/tamanho) — 'high' para não perder frames.
         await driver.execute('mobile: startMediaProjectionRecording', {
           resolution: '1280x720',
-          maxDurationSec: 600,
+          maxDurationSec: 1200, // acompanha o mochaOpts.timeout — vídeo não pode terminar antes do teste
           priority: 'high',
         });
       } else {
-        // MediaProjection é exclusivo do UiAutomator2. No iOS o XCUITest grava
-        // via startRecordingScreen; `videoType`/`videoQuality` mantêm o arquivo
-        // em h264 (o default MJPEG do WDA não toca em <video> no navegador).
-        await driver.startRecordingScreen(
-          IS_IOS
-            ? { timeLimit: '600', videoType: 'libx264', videoQuality: 'medium', videoFps: 10 }
-            : { timeLimit: '180' },
-        );
+        await driver.startRecordingScreen({ timeLimit: '180' });
       }
     } catch (e) {
       console.warn('[video] Falha ao iniciar gravação:', e);
@@ -212,9 +302,12 @@ export const config: WebdriverIO.Config = {
   afterTest: async function (test, _context, { error }) {
     const baseName = testFileBaseName(test);
 
-    // 1. Vídeo — sempre (todos os testes, passando ou falhando).
+    // 1. Vídeo — sempre (todos os testes, passando ou falhando), exceto em
+    // Remote Access (não suportado) e Device Farm iOS (vídeo do próprio DF, ver beforeTest).
     try {
-      const base64 = (isDeviceFarm && !IS_IOS
+      if (isRemote) throw new Error('gravação não suportada em Remote Access');
+      if (isDeviceFarm && isIOS) throw new Error('Device Farm iOS: vídeo anexado pelo CI a partir do artefato VIDEO');
+      const base64 = (isDeviceFarm && !isIOS
         ? await driver.execute('mobile: stopMediaProjectionRecording')
         : await driver.stopRecordingScreen()) as string;
       if (base64) {
@@ -282,19 +375,3 @@ export const config: WebdriverIO.Config = {
     });
   },
 };
-
-// No Device Farm o Appium já está no ar (subido pelo testspec na fase pre_test)
-// em localhost:4723; apontamos o WDIO para ele. No alvo Android local o appium
-// service gerencia host/porta automaticamente, então nada é setado.
-if (isDeviceFarm) {
-  config.hostname = 'localhost';
-  config.port = 4723;
-  config.path = '/';
-} else if (remoteIosSession) {
-  config.hostname = remoteIosSession.host;
-  config.port = remoteIosSession.port;
-  // Se o endpoint da sessão do Device Farm incluir um base path (ex.: /wd/hub),
-  // é aqui que ele entra — a sessão atual assume a raiz.
-  config.path = '/';
-  config.protocol = remoteIosSession.port === 443 ? 'https' : 'http';
-}

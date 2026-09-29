@@ -1,0 +1,15 @@
+{
+  "mode": "interactive",
+  "depth": "standard",
+  "parallelization": false,
+  "commit_docs": false,
+  "model_profile": "balanced",
+  "workflow": {
+    "research": false,
+    "plan_check": true,
+    "verifier": true
+  },
+  "git": {
+    "branching_strategy": "none"
+  }
+}

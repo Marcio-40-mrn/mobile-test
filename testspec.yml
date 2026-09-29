@@ -9,10 +9,26 @@ phases:
       - node --version
       - devicefarm-cli use appium 3
       - appium --version
-      - appium driver install uiautomator2
+      # `appium` NÃO é devDependency do projeto (regra herdada da referência MobileWDIO,
+      # run-22): se fosse, o Appium do host trataria o pacote de teste como APPIUM_HOME e
+      # perderia os drivers pré-instalados. Com o APPIUM_HOME do host, o Appium 3 já vem
+      # com o UiAutomator2 v6; trocamos pela versão que o Android roda desde sempre
+      # (7.6.2 = package-lock.json) no padrão da doc da AWS: uninstall + install@versão.
+      - |-
+        appium driver uninstall uiautomator2;
+        appium driver install uiautomator2@7.6.2;
+      - appium driver list --installed
       - export APPIUM_BASE_PATH=
       - cd $DEVICEFARM_TEST_PACKAGE_PATH
-      - npm install --prefer-offline
+      # O host às vezes derruba a conexão baixando pacotes (ECONNRESET). Sem
+      # dependências o `npm run wdio` dá "wdio: command not found", o teste nem
+      # roda e o device some do relatório sem erro óbvio. Três tentativas.
+      - |-
+        for i in 1 2 3; do
+          npm install --prefer-offline && break
+          echo "npm install falhou (tentativa $i/3)"; sleep 10
+          [ "$i" = 3 ] && { echo "npm install esgotou as 3 tentativas"; exit 1; }
+        done
 
   pre_test:
     commands:
@@ -45,8 +61,21 @@ phases:
       - cd $DEVICEFARM_TEST_PACKAGE_PATH
       # Materializa as credenciais injetadas pelo schedule-run (--configuration
       # environmentVariables) num .env local — o pacote nunca carrega segredos.
-      # Os valores não vão para o log: só os nomes das variáveis aparecem no comando.
-      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PIN=%s\n" "$TEST_USER_EMAIL" "$TEST_USER_PASSWORD" "$TEST_USER_PIN" > .env'
+      # TEST_USER_EMAILS / TEST_USER_DEVICE_MODELS só existem quando o CI está em
+      # modo "uma conta por device" (secret TEST_USER_ANDROID_EMAILS); vazias, o
+      # runtime cai em TEST_USER_EMAIL (test/utils/credentials.ts).
+      # Guarda: credencial ausente falha AQUI, com nome, e não três telas depois
+      # dentro do login. Os valores nunca vão para o log — só os comprimentos.
+      - |-
+        if [ -z "${TEST_USER_EMAIL:-}${TEST_USER_EMAILS:-}" ] || [ -z "${TEST_USER_PASSWORD:-}" ] || [ -z "${TEST_USER_PIN:-}" ]; then
+          echo "Credenciais ausentes no host: confira as environmentVariables do step 'Agenda o run (Android)' em mobile_test.yml"
+          exit 1
+        fi
+      - 'echo "[diag] TEST_USER_EMAIL len=${#TEST_USER_EMAIL} TEST_USER_EMAILS len=${#TEST_USER_EMAILS} TEST_USER_DEVICE_MODELS len=${#TEST_USER_DEVICE_MODELS} TEST_USER_PASSWORD len=${#TEST_USER_PASSWORD} TEST_USER_PIN len=${#TEST_USER_PIN}"'
+      - 'printf "TEST_USER_EMAIL=%s\nTEST_USER_EMAILS=%s\nTEST_USER_DEVICE_MODELS=%s\nTEST_USER_PASSWORD=%s\nTEST_USER_PASSWORD_IOS=%s\nBUILD_PROFILE_ANDROID=%s\nTEST_USER_PIN=%s\n" "${TEST_USER_EMAIL:-}" "${TEST_USER_EMAILS:-}" "${TEST_USER_DEVICE_MODELS:-}" "$TEST_USER_PASSWORD" "${TEST_USER_PASSWORD_IOS:-}" "${BUILD_PROFILE_ANDROID:-}" "$TEST_USER_PIN" > .env'
+      # Versão/build/profile do app (do EAS, via environmentVariables) → environment.properties do Allure.
+      - 'printf "APP_VERSION=%s\nAPP_BUILD_VERSION=%s\nAPP_BUILD_PROFILE=%s\n" "${APP_VERSION:-}" "${APP_BUILD_VERSION:-}" "${APP_BUILD_PROFILE:-}" >> .env'
+      - 'echo "[diag] app ${APP_VERSION:-?} (${APP_BUILD_VERSION:-?}) profile ${APP_BUILD_PROFILE:-?}"'
       - npm run wdio
 
   post_test:
