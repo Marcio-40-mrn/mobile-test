@@ -1,0 +1,1 @@
+[{"values":["Android"],"name":"Platform"},{"values":["AWS Device Farm"],"name":"Environment"},{"values":["com.aramis.arys"],"name":"App"},{"values":["1.6.0"],"name":"AppVersion"},{"values":["138"],"name":"AppBuildVersion"},{"values":["production"],"name":"BuildProfile"},{"values":["UiAutomator2"],"name":"Automation"},{"values":["WebdriverIO 9 + Appium"],"name":"Framework"}]
